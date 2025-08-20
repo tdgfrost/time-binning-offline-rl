@@ -29,6 +29,16 @@ class AlternatingStep(Transform):
         # Add the key to the root spec (under 'observation_spec').
         spec.set(("full_observation_spec", "step_skip"), step_skip_spec.clone())
 
+        # Change the environment's observation spec to include the current four frames and the previous four frames.
+        obs_spec = spec.get("full_observation_spec").get("observations").clone()
+        spec.set(("full_observation_spec", "isolated_observations"), obs_spec.clone())
+        new_obs_spec = Unbounded(
+            shape=(obs_spec.shape[0]*2,) + tuple(obs_spec.shape[1:]),
+            device=spec.device,
+            dtype=obs_spec.dtype,
+        )
+        spec.set(("full_observation_spec", "observations"), new_obs_spec)
+
         # Add the "intermediate" key, which holds a full 'next' state.
         reference_spec = spec.clone()
         for spec_key, reference_keys in [
@@ -54,12 +64,24 @@ class AlternatingStep(Transform):
 
         # Add the initial 'step_skip' value to the reset tensordict.
         td_reset.set("step_skip", self.step_mode.clone())
+        # Set our "isolated_observations" key to the reset tensordict.
+        td_reset.set("isolated_observations", td_reset.get("observations").clone())
+        # For "observations", just duplicate the observations
+        td_reset.set("observations", td_reset.get("observations").repeat([2,1,1]))
         # Set the "intermediate" key to the reset tensordict.
         td_reset.set("intermediate", td_reset.clone())
         return td_reset
 
     def _alternate_step(self):
         self.step_mode = self.step_mode % 2 + 1
+
+    @staticmethod
+    def _stack_obs(old_td, new_td):
+        # For next_td, change observations to "isolated_observations"
+        new_td.set("isolated_observations", new_td.get("observations").clone())
+        # For next_td, concat the current observations with the previous ones
+        new_td.set("observations", torch.cat([old_td.get("isolated_observations"),
+                                               new_td.get("isolated_observations")], dim=0))
 
     def _step(self, initial_td: TensorDictBase, next_td, **kwargs) -> TensorDictBase:
         """
@@ -82,9 +104,13 @@ class AlternatingStep(Transform):
             initial_td.set("step_skip", self.step_mode.clone())
 
         if initial_td.get('step_skip') == 1:
+            # Stack the observations across 8 frames
+            self._stack_obs(initial_td, next_td)
+
             # Set the "intermediate" key to the next_td
             next_td.set("intermediate", next_td.clone())
             next_td.set(("intermediate", "step_skip"), initial_td.get("step_skip").clone())
+
             # Alternate the mode for the *next* step
             self._alternate_step()
             next_td.set("step_skip", self.step_mode.clone())
@@ -92,17 +118,26 @@ class AlternatingStep(Transform):
 
         # --- Mode 2: Take two consecutive environment steps ---
         else:
-            # Create an intermediate tensordict to hold the state after the first step
+            # Stack the observations across 8 frames
+            self._stack_obs(initial_td, next_td)
+
+            # Create a third tensordict to hold the state after the first step
             one_extra_td = next_td.clone()
             one_extra_td.set('action', initial_td.get('action').clone())
 
             # Perform our second step
             self.parent.step(one_extra_td)
+            one_extra_td = one_extra_td.get("next")
 
-            # Update our next_td with the final state
+            # Stack the observations across 8 frames for one_extra_td
+            self._stack_obs(initial_td, one_extra_td)
+
+            # Update our next_td with the intermediate and final states
             next_td.set("intermediate", next_td.clone())
             next_td.set(("intermediate", "step_skip"), initial_td.get("step_skip").clone())
-            next_td.update(one_extra_td.get("next").clone())
+            next_td.update(one_extra_td.clone())
+
+            # Set the "step_skip" key for the next step
             self._alternate_step()
             next_td.set("step_skip", self.step_mode.clone())
             return next_td
