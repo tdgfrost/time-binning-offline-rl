@@ -1,0 +1,37 @@
+# Environment
+env:
+    env_name: "Breakout"
+    n_train_envs: 8
+    n_eval_envs: 5
+    frame_skip: 4
+
+# Optimizer
+optimizer:
+    type: "Adam"
+    learning_rate: 2.5e-4
+    weight_decay: 0.0
+    eps: 1.0e-5
+
+# Loss
+loss:
+    gamma: 0.99
+    gae_lambda: 0.95
+    average_gae: False
+    clip_epsilon: 0.1
+    ppo_epochs: 4
+    entropy_bonus: True
+    entropy_coef: 0.01
+    critic_coef: 1  # Relative weight on critic compared to actor
+    loss_critic_type: "l2"
+    normalize_advantage: True
+
+# Collector
+collector:
+    minibatch_size: 256
+    frames_per_batch: 1024
+    total_frames: 10_000_000
+
+# Logging
+logging:
+    eval_freq: 100_000  # n frames
+    save_freq: 100_000  
