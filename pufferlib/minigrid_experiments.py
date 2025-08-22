@@ -1,3 +1,5 @@
+from typing import Sequence
+
 from gymnasium.envs.registration import register, WrapperSpec
 from tqdm import tqdm
 import torch.nn as nn
@@ -8,39 +10,86 @@ from pathlib import Path
 from minari import DataCollector
 import d3rlpy
 import minari
-from d3rlpy.algos import DiscreteCQLConfig
+from d3rlpy.algos import DiscreteCQLConfig, DiscreteBCConfig
 from d3rlpy.preprocessing import StandardObservationScaler
+from d3rlpy.metrics import EnvironmentEvaluator
+from d3rlpy.models.encoders import register_encoder_factory
+import dataclasses
 
 from importable_wrappers import *
 
 train_ppo = False
-generate_dataset = True
-train_iql = True
+generate_dataset = False
+train_cql = True
 render_performance = False
 
-class MinigridFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.Space, features_dim: int = 512, normalized_image: bool = False) -> None:
-        super().__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[0]
+class MiniGridCNN(nn.Module):
+    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
+                 has_mlp=False) -> None:
+        super().__init__()
+        if observation_shape[-1] in (1, 4):
+            H, W, C = observation_shape
+            self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)
+        else:
+            C, H, W = observation_shape
+            self.permute_obs_maybe = lambda x: x
+
+        if is_dummy:
+            C -= 1  # we will ignore the last channel (the repeat flag)
+            self.filter_obs_maybe = lambda x: x[:, :C, :, :]
+        else:
+            self.filter_obs_maybe = lambda x: x
+
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 16, (2, 2)),
+            nn.Conv2d(C, 16, kernel_size=2),
             nn.ReLU(),
-            nn.Conv2d(16, 32, (2, 2)),
+            nn.Conv2d(16, 32, kernel_size=2),
             nn.ReLU(),
-            nn.Conv2d(32, 64, (2, 2)),
+            nn.Conv2d(32, 64, kernel_size=2),
             nn.ReLU(),
             nn.Flatten(),
         )
-
-        # Compute shape by doing one forward pass
         with torch.no_grad():
-            n_flatten = self.cnn(torch.as_tensor(observation_space.sample()[None]).float()).shape[1]
+            n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
+        self.fc = nn.Sequential(nn.Linear(n_flat, feature_size), nn.ReLU())
 
-        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
+        if has_mlp:
+            self.mlp_maybe = nn.Sequential(nn.Linear(feature_size, feature_size), nn.ReLU())
+        else:
+            self.mlp_maybe = lambda x: x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.permute_obs_maybe(x)
+        x = self.filter_obs_maybe(x)
+        return self.mlp_maybe(self.fc(self.cnn(x)))
+
+
+class MinigridFeaturesExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.Space, features_dim: int = 512) -> None: #, normalized_image: bool = False) -> None:
+        super().__init__(observation_space, features_dim)
+        self.net = MiniGridCNN(observation_space.shape, feature_size=features_dim)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.linear(self.cnn(observations))
+        return self.net(observations)
 
+
+@dataclasses.dataclass()
+class MiniGridCNNFactory(d3rlpy.models.encoders.EncoderFactory):
+    is_dummy: bool = False
+    has_mlp: bool = True
+    feature_size: int = 128
+
+    def create(self, observation_shape: Sequence[int]) -> nn.Module:
+        return MiniGridCNN(tuple(observation_shape), feature_size=self.feature_size, is_dummy=self.is_dummy,
+                           has_mlp=self.has_mlp)
+
+    @staticmethod
+    def get_type() -> str:
+        return "minigrid_cnn"
+
+
+# Register in d3rlpy (so the model can be saved/loaded)
+register_encoder_factory(MiniGridCNNFactory)
 
 class SaveEachBestCallback(BaseCallback):
     """Called by EvalCallback when a new best model is found."""
@@ -89,14 +138,6 @@ register(
 )
 
 
-"""
-register(
-    id="LavaGapS7AltStep-v0",
-    entry_point=lambda **kwargs: make_wrapped_env("MiniGrid-LavaGapS7-v0", **kwargs),
-)
-"""
-
-
 if __name__ == "__main__":
     policy_kwargs = dict(
         features_extractor_class=MinigridFeaturesExtractor,
@@ -121,12 +162,13 @@ if __name__ == "__main__":
         base_env = gym.make(env_name)
         recorded_env = DataCollector(base_env, record_infos=True, data_format="arrow")
 
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=120000_mean=0.57.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_002_steps=100000_mean=0.38.zip',
                                  env=recorded_env, device="auto")
 
         # Collect episodes
-        target_frames = 100#_000
+        target_frames = 100_000
         seed = 123
+        model.set_random_seed(123)
         n_frames = 0
         ep_count = 0
         stop_loop = False
@@ -137,7 +179,7 @@ if __name__ == "__main__":
                 obs, info = recorded_env.reset(seed=seed + ep_count)
                 done = False
                 while not done:
-                    action, _ = model.predict(obs, deterministic=True)
+                    action, _ = model.predict(obs)
                     obs, reward, terminated, truncated, info = recorded_env.step(action)
                     done = terminated or truncated
                     n_frames += 1
@@ -150,7 +192,7 @@ if __name__ == "__main__":
         # Save dataset
         dataset = recorded_env.create_dataset(
             dataset_id=dataset_id,
-            algorithm_name="PPO-0.57",
+            algorithm_name="PPO-0.38",
             eval_env=base_env,
             expert_policy=model,
         )
@@ -158,30 +200,41 @@ if __name__ == "__main__":
         print("Total episodes collected: ", dataset.total_episodes)
         print("Total steps collected: ", dataset.total_steps)
 
-    if train_iql:
+    if train_cql:
         # Load the dataset via d3rlpy's minari integration
         dataset, _ = d3rlpy.datasets.get_minari(dataset_id)
         # Get the environment for later evaluation
         eval_env = minari.load_dataset(dataset_id).recover_environment()
-        # Set up IQL
-        algo = DiscreteCQLConfig(observation_scaler=StandardObservationScaler()).create()
-        # Train IQL
-        algo.fit(dataset, n_steps=1000)
-        algo.fit(
-            dataset,
-            n_steps=200_000,
-            n_steps_per_epoch=10_000,
-            save_interval=50_000,
-            eval_env=eval_env,
-            eval_episodes=10,
-            eval_interval=10,
-            experiment_name="iql_minigrid_lavagap_altstep",
-            logdir="./iql_minigrid_logs",
-        )
+        env_evaluator = EnvironmentEvaluator(eval_env, n_trials=5)
+        # Set up CQL
+        for algo_type in ["smart", "dumb"]:
+            """
+            algo = DiscreteCQLConfig(encoder_factory=MiniGridCNNFactory(feature_size=128,
+                                                                        is_dummy=algo_type == "dumb")).create()
+            """
+            algo = DiscreteBCConfig(batch_size=128,
+                                    encoder_factory=MiniGridCNNFactory(feature_size=128,
+                                                                       is_dummy=algo_type == "dumb")).create()
+            # Train CQL
+            algo.fit(
+                dataset,
+                n_steps=1_000_000,
+                n_steps_per_epoch=50_000,
+                evaluators={
+                    'environment': env_evaluator,
+                },
+                callback=None,
+                experiment_name=f"cql_{algo_type}_minigrid_lavagap_altstep",
+                show_progress=False,
+            )
+
+            algo.save(f"cql_{algo_type}_minigrid_lavagap_altstep_final.d3")
+
+        # algo = d3rlpy.load_learnable(f"./d3rlpy_logs/cql_smart_minigrid_lavagap_altstep_20250822181226/model_20000.d3")
 
     if render_performance:
         # Managing your own trainer
-        eval_env = make_wrapped_env(env_name)
+        eval_env = gym.make(env_name)
         observation, info = eval_env.reset(seed=42)
         for _ in tqdm(range(1000)):
             action = model.predict(observation)[0]  # User-defined policy function
