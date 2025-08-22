@@ -21,15 +21,18 @@ tensordict = ">=0.7.2, <0.10"
 torchvision = ">=0.23.0, <0.24"
 tensorboard = ">=2.20.0, <3"
 gymnasium = { version = "<1.0", extras = ["atari", "accept-rom-license"] }
+minigrid = ">=3.0.0, <4"
 
 [feature.pufferlib.tasks]
-pufferlib = "uv pip install 'pufferlib[minigrid]' --no-build-isolation"
+pufferlib = "uv pip install 'pufferlib[minigrid]' --no-build-isolation; uv pip install gym==0.26.0"
 
 [feature.pufferlib.pypi-dependencies]
 setuptools = ">=80.9.0, <81"
 click = ">=8.2.1, <9"
 requests = ">=2.32.5, <3"
 stable-baselines3 = ">=2.7.0, <3"
+minari = { version = ">=0.5.3, <0.6", extras = ["arrow", "create", "hdf5"] }
+d3rlpy = "==2.6.1"
 
 [environments]
 torchrl = ["torchrl"]
