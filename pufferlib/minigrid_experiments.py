@@ -1,4 +1,7 @@
 from typing import Sequence
+import types
+import glob
+import os
 
 from gymnasium.envs.registration import register, WrapperSpec
 from tqdm import tqdm
@@ -19,8 +22,8 @@ import dataclasses
 from importable_wrappers import *
 
 train_ppo = False
-generate_dataset = False
-train_cql = True
+generate_dataset = True
+train_cql = False
 render_performance = False
 
 class MiniGridCNN(nn.Module):
@@ -54,7 +57,10 @@ class MiniGridCNN(nn.Module):
         self.fc = nn.Sequential(nn.Linear(n_flat, feature_size), nn.ReLU())
 
         if has_mlp:
-            self.mlp_maybe = nn.Sequential(nn.Linear(feature_size, feature_size), nn.ReLU())
+            self.mlp_maybe = nn.Sequential(nn.Linear(feature_size, feature_size // 2),
+                                           nn.Tanh(),
+                                           nn.Linear(feature_size // 2, feature_size // 2),
+                                           nn.Tanh())
         else:
             self.mlp_maybe = lambda x: x
 
@@ -137,6 +143,10 @@ register(
     ),
 )
 
+# Create action sampling for DiscreteBC
+def new_inner_predict_best_action(self, x) -> torch.Tensor:
+    return self._modules.imitator(x).sample()
+
 
 if __name__ == "__main__":
     policy_kwargs = dict(
@@ -166,7 +176,7 @@ if __name__ == "__main__":
                                  env=recorded_env, device="auto")
 
         # Collect episodes
-        target_frames = 100_000
+        target_frames = 1_000_000
         seed = 123
         model.set_random_seed(123)
         n_frames = 0
@@ -205,30 +215,51 @@ if __name__ == "__main__":
         dataset, _ = d3rlpy.datasets.get_minari(dataset_id)
         # Get the environment for later evaluation
         eval_env = minari.load_dataset(dataset_id).recover_environment()
-        env_evaluator = EnvironmentEvaluator(eval_env, n_trials=5)
+        env_evaluator = EnvironmentEvaluator(eval_env, n_trials=50)
         # Set up CQL
         for algo_type in ["smart", "dumb"]:
-            """
-            algo = DiscreteCQLConfig(encoder_factory=MiniGridCNNFactory(feature_size=128,
+
+            algo = DiscreteCQLConfig(batch_size=128,
+                                     observation_scaler=StandardObservationScaler(),
+                                     encoder_factory=MiniGridCNNFactory(feature_size=128,
                                                                         is_dummy=algo_type == "dumb")).create()
             """
             algo = DiscreteBCConfig(batch_size=128,
+                                    observation_scaler=StandardObservationScaler(),
+                                    beta=0.0,
                                     encoder_factory=MiniGridCNNFactory(feature_size=128,
-                                                                       is_dummy=algo_type == "dumb")).create()
-            # Train CQL
+                                                                       is_dummy=algo_type == "dumb")).create()]
+            """
+            algo.build_with_dataset(dataset)
+
+            # Replace greedy action selecting with sampling
+            # algo._impl.inner_predict_best_action = types.MethodType(new_inner_predict_best_action, algo._impl)
+
+            # Train bc
+            experiment_name = f"cql_{algo_type}_minigrid_lavagap_altstep"
             algo.fit(
                 dataset,
-                n_steps=1_000_000,
-                n_steps_per_epoch=50_000,
+                n_steps=200_000,
+                n_steps_per_epoch=20_000,
                 evaluators={
                     'environment': env_evaluator,
                 },
                 callback=None,
-                experiment_name=f"cql_{algo_type}_minigrid_lavagap_altstep",
+                experiment_name=experiment_name,
                 show_progress=False,
             )
 
-            algo.save(f"cql_{algo_type}_minigrid_lavagap_altstep_final.d3")
+            full_eval_result = EnvironmentEvaluator(eval_env, n_trials=500)(algo, dataset=None)
+
+            print(f"Overall result of {algo_type}: ", full_eval_result)
+
+            # Get full directory name
+            try:
+                experiment_dir = glob.glob(f"./d3rlpy_logs/{experiment_name}_*")[0]
+                with open(os.path.join(experiment_dir, "final_eval.txt"), "w") as f:
+                    f.write(str(full_eval_result))
+            except:
+                continue
 
         # algo = d3rlpy.load_learnable(f"./d3rlpy_logs/cql_smart_minigrid_lavagap_altstep_20250822181226/model_20000.d3")
 
