@@ -13,7 +13,7 @@ from pathlib import Path
 from minari import DataCollector
 import d3rlpy
 import minari
-from d3rlpy.algos import DiscreteCQLConfig, DiscreteBCConfig
+from d3rlpy.algos import DiscreteCQLConfig, DiscreteBCConfig, DiscreteIQLConfig
 from d3rlpy.preprocessing import StandardObservationScaler
 from d3rlpy.metrics import EnvironmentEvaluator
 from d3rlpy.models.encoders import register_encoder_factory
@@ -22,9 +22,10 @@ import dataclasses
 from importable_wrappers import *
 
 train_ppo = False
-generate_dataset = True
-train_cql = False
+generate_dataset = False
+train_iql = True
 render_performance = False
+
 
 class MiniGridCNN(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
@@ -143,10 +144,6 @@ register(
     ),
 )
 
-# Create action sampling for DiscreteBC
-def new_inner_predict_best_action(self, x) -> torch.Tensor:
-    return self._modules.imitator(x).sample()
-
 
 if __name__ == "__main__":
     policy_kwargs = dict(
@@ -176,7 +173,7 @@ if __name__ == "__main__":
                                  env=recorded_env, device="auto")
 
         # Collect episodes
-        target_frames = 1_000_000
+        target_frames = 500_000
         seed = 123
         model.set_random_seed(123)
         n_frames = 0
@@ -202,7 +199,7 @@ if __name__ == "__main__":
         # Save dataset
         dataset = recorded_env.create_dataset(
             dataset_id=dataset_id,
-            algorithm_name="PPO-0.38",
+            algorithm_name="PPO-0.50",
             eval_env=base_env,
             expert_policy=model,
         )
@@ -210,43 +207,37 @@ if __name__ == "__main__":
         print("Total episodes collected: ", dataset.total_episodes)
         print("Total steps collected: ", dataset.total_steps)
 
-    if train_cql:
+    if train_iql:
         # Load the dataset via d3rlpy's minari integration
         dataset, _ = d3rlpy.datasets.get_minari(dataset_id)
         # Get the environment for later evaluation
         eval_env = minari.load_dataset(dataset_id).recover_environment()
         env_evaluator = EnvironmentEvaluator(eval_env, n_trials=50)
-        # Set up CQL
+        # Set up IQL
         for algo_type in ["smart", "dumb"]:
+            algo = DiscreteIQLConfig(batch_size=128,
+                                     # observation_scaler=StandardObservationScaler(),
+                                     actor_encoder_factory=MiniGridCNNFactory(feature_size=128,
+                                                                              is_dummy=algo_type == "dumb"),
+                                     value_encoder_factory=MiniGridCNNFactory(feature_size=128,
+                                                                              is_dummy=algo_type == "dumb"),
+                                     critic_encoder_factory=MiniGridCNNFactory(feature_size=128,
+                                                                              is_dummy=algo_type == "dumb"),
+                                     expectile=0.8,
+                                     ).create()
 
-            algo = DiscreteCQLConfig(batch_size=128,
-                                     observation_scaler=StandardObservationScaler(),
-                                     encoder_factory=MiniGridCNNFactory(feature_size=128,
-                                                                        is_dummy=algo_type == "dumb")).create()
-            """
-            algo = DiscreteBCConfig(batch_size=128,
-                                    observation_scaler=StandardObservationScaler(),
-                                    beta=0.0,
-                                    encoder_factory=MiniGridCNNFactory(feature_size=128,
-                                                                       is_dummy=algo_type == "dumb")).create()]
-            """
-            algo.build_with_dataset(dataset)
-
-            # Replace greedy action selecting with sampling
-            # algo._impl.inner_predict_best_action = types.MethodType(new_inner_predict_best_action, algo._impl)
-
-            # Train bc
-            experiment_name = f"cql_{algo_type}_minigrid_lavagap_altstep"
+            # Train iql
+            experiment_name = f"iql_{algo_type}_minigrid_lavagap_altstep"
             algo.fit(
                 dataset,
                 n_steps=200_000,
-                n_steps_per_epoch=20_000,
+                n_steps_per_epoch=1_000,
                 evaluators={
                     'environment': env_evaluator,
                 },
                 callback=None,
                 experiment_name=experiment_name,
-                show_progress=False,
+                show_progress=True,
             )
 
             full_eval_result = EnvironmentEvaluator(eval_env, n_trials=500)(algo, dataset=None)
@@ -254,12 +245,9 @@ if __name__ == "__main__":
             print(f"Overall result of {algo_type}: ", full_eval_result)
 
             # Get full directory name
-            try:
-                experiment_dir = glob.glob(f"./d3rlpy_logs/{experiment_name}_*")[0]
-                with open(os.path.join(experiment_dir, "final_eval.txt"), "w") as f:
-                    f.write(str(full_eval_result))
-            except:
-                continue
+            experiment_dir = glob.glob(f"./d3rlpy_logs/{experiment_name}_*")[0]
+            with open(os.path.join(experiment_dir, "final_eval.txt"), "w") as f:
+                f.write(str(full_eval_result))
 
         # algo = d3rlpy.load_learnable(f"./d3rlpy_logs/cql_smart_minigrid_lavagap_altstep_20250822181226/model_20000.d3")
 
