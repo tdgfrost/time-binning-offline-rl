@@ -175,9 +175,9 @@ if __name__ == "__main__":
         # Collect episodes
         target_frames = 500_000
         seed = 123
-        model.set_random_seed(123)
         n_frames = 0
         ep_count = 0
+        frame_count = 0
         stop_loop = False
         print("\n===== Generating dataset =====\n")
         with tqdm(total=target_frames, desc="Progress", mininterval=2.0) as pbar:
@@ -186,6 +186,8 @@ if __name__ == "__main__":
                 obs, info = recorded_env.reset(seed=seed + ep_count)
                 done = False
                 while not done:
+                    frame_count += 1
+                    model.set_random_seed(seed + frame_count)
                     action, _ = model.predict(obs)
                     obs, reward, terminated, truncated, info = recorded_env.step(action)
                     done = terminated or truncated
