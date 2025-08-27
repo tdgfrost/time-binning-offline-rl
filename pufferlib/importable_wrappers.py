@@ -133,11 +133,16 @@ class MiniGridCNN(nn.Module):
             C, H, W = observation_shape
             self.permute_obs_maybe = lambda x: x
 
+        C -= 1  # we will ignore the last channel (the repeat flag)
+        self.split_obs = lambda x: (x[:, :C, :, :], x[:, -1, 0, 0].unsqueeze(-1))
         if is_dummy:
-            C -= 1  # we will ignore the last channel (the repeat flag)
-            self.filter_obs_maybe = lambda x: x[:, :C, :, :]
+            self.process_flag_maybe = lambda x: torch.zeros_like(x)
         else:
-            self.filter_obs_maybe = lambda x: x
+            self.process_flag_maybe = nn.Sequential(
+                nn.Linear(1, feature_size // 2),
+                nn.ReLU(),
+                nn.Linear(feature_size // 2, feature_size)
+            )
 
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
@@ -178,8 +183,9 @@ class MiniGridCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.permute_obs_maybe(x)
-        x = self.filter_obs_maybe(x)
-        return self.mlp_maybe(self.fc(self.cnn(x)))
+        x, x_flag = self.split_obs(x)
+        x_flag = self.process_flag_maybe(x_flag)
+        return self.mlp_maybe(self.fc(self.cnn(x)) + x_flag)
 
 
 class MinigridFeaturesExtractor(BaseFeaturesExtractor):
