@@ -406,7 +406,9 @@ class CustomIQL(nn.Module):
         q1, q2 = self.critic_net1(obs, masks, acts), self.critic_net2(obs, masks, acts)
         with torch.no_grad():
             v_next = self.target_value_net(next_obs, next_masks)
-            q_target = rews + self._gamma * (1 - dones) * v_next
+            flag = obs[:, -1, -1, -1, -1].unsqueeze(-1)
+            flag = torch.where(flag == 1, 3, 1)
+            q_target = rews + self._gamma ** flag * (1 - dones) * v_next
 
         loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
         self.critic_optim.zero_grad()
