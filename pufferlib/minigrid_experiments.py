@@ -1,23 +1,16 @@
-from typing import Sequence
-import types
 import glob
 import os
+import types
 
 from gymnasium.envs.registration import register, WrapperSpec
 from tqdm import tqdm
-import torch.nn as nn
-import torch
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
-from pathlib import Path
+from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from minari import DataCollector
 import d3rlpy
 import minari
 from d3rlpy.algos import DiscreteCQLConfig, DiscreteBCConfig, DiscreteIQLConfig
-from d3rlpy.preprocessing import StandardObservationScaler
 from d3rlpy.metrics import EnvironmentEvaluator
-from d3rlpy.models.encoders import register_encoder_factory
-import dataclasses
+from d3rlpy.preprocessing import StandardObservationScaler
 
 from importable_wrappers import *
 
@@ -25,100 +18,6 @@ train_ppo = False
 generate_dataset = False
 train_iql = True
 render_performance = False
-
-
-class MiniGridCNN(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
-                 has_mlp=False) -> None:
-        super().__init__()
-        if observation_shape[-1] in (1, 4):
-            H, W, C = observation_shape
-            self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)
-        else:
-            C, H, W = observation_shape
-            self.permute_obs_maybe = lambda x: x
-
-        if is_dummy:
-            C -= 1  # we will ignore the last channel (the repeat flag)
-            self.filter_obs_maybe = lambda x: x[:, :C, :, :]
-        else:
-            self.filter_obs_maybe = lambda x: x
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(C, 16, kernel_size=2),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=2),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=2),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        with torch.no_grad():
-            n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
-        self.fc = nn.Sequential(nn.Linear(n_flat, feature_size), nn.ReLU())
-
-        if has_mlp:
-            self.mlp_maybe = nn.Sequential(nn.Linear(feature_size, feature_size // 2),
-                                           nn.Tanh(),
-                                           nn.Linear(feature_size // 2, feature_size // 2),
-                                           nn.Tanh())
-        else:
-            self.mlp_maybe = lambda x: x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.permute_obs_maybe(x)
-        x = self.filter_obs_maybe(x)
-        return self.mlp_maybe(self.fc(self.cnn(x)))
-
-
-class MinigridFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.Space, features_dim: int = 512) -> None: #, normalized_image: bool = False) -> None:
-        super().__init__(observation_space, features_dim)
-        self.net = MiniGridCNN(observation_space.shape, feature_size=features_dim)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.net(observations)
-
-
-@dataclasses.dataclass()
-class MiniGridCNNFactory(d3rlpy.models.encoders.EncoderFactory):
-    is_dummy: bool = False
-    has_mlp: bool = True
-    feature_size: int = 128
-
-    def create(self, observation_shape: Sequence[int]) -> nn.Module:
-        return MiniGridCNN(tuple(observation_shape), feature_size=self.feature_size, is_dummy=self.is_dummy,
-                           has_mlp=self.has_mlp)
-
-    @staticmethod
-    def get_type() -> str:
-        return "minigrid_cnn"
-
-
-# Register in d3rlpy (so the model can be saved/loaded)
-register_encoder_factory(MiniGridCNNFactory)
-
-class SaveEachBestCallback(BaseCallback):
-    """Called by EvalCallback when a new best model is found."""
-    def __init__(self, save_dir: str, verbose: int = 0):
-        super().__init__(verbose)
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.idx = 0
-
-    def _on_step(self) -> bool:
-        # This is triggered by EvalCallback when there's a new best
-        self.idx += 1
-        best_mean = getattr(self.parent, "best_mean_reward", None)  # provided by EvalCallback
-        if best_mean is None:
-            fname = f"best_{self.idx:03d}_steps={self.num_timesteps}.zip"
-        else:
-            fname = f"best_{self.idx:03d}_steps={self.num_timesteps}_mean={best_mean:.2f}.zip"
-        path = self.save_dir / fname
-        self.model.save(str(path))
-        if self.verbose:
-            print(f"[SaveEachBest] Saved: {path}")
-        return True
 
 
 register(
@@ -209,7 +108,7 @@ if __name__ == "__main__":
         print("Total episodes collected: ", dataset.total_episodes)
         print("Total steps collected: ", dataset.total_steps)
 
-    if train_iql:
+    if False: # train_iql:
         # Load the dataset via d3rlpy's minari integration
         dataset, _ = d3rlpy.datasets.get_minari(dataset_id)
         # Get the environment for later evaluation
@@ -238,6 +137,50 @@ if __name__ == "__main__":
                     'environment': env_evaluator,
                 },
                 callback=None,
+                experiment_name=experiment_name,
+                show_progress=True,
+            )
+
+            full_eval_result = EnvironmentEvaluator(eval_env, n_trials=500)(algo, dataset=None)
+
+            print(f"Overall result of {algo_type}: ", full_eval_result)
+
+            # Get full directory name
+            experiment_dir = glob.glob(f"./d3rlpy_logs/{experiment_name}_*")[0]
+            with open(os.path.join(experiment_dir, "final_eval.txt"), "w") as f:
+                f.write(str(full_eval_result))
+
+        # algo = d3rlpy.load_learnable(f"./d3rlpy_logs/cql_smart_minigrid_lavagap_altstep_20250822181226/model_20000.d3")
+
+    if train_iql:
+        # Load the dataset via d3rlpy's minari integration
+        dataset, _ = d3rlpy.datasets.get_minari(dataset_id, trajectory_slicer=CustomTrajectorySlicer())
+        dataset.sample_trajectory_batch = types.MethodType(sample_trajectory_batch, dataset)
+        input_length = 2  # For LSTM model
+        # Get the environment for later evaluation
+        eval_env = minari.load_dataset(dataset_id).recover_environment()
+        env_evaluator = CustomEnvironmentEvaluator(eval_env, n_trials=50, input_length=input_length)
+        # Set up IQL
+        for algo_type in ["smart", "dumb"]:
+            algo = CustomIQL(observation_shape=eval_env.observation_space.shape,
+                             action_size=eval_env.action_space.n,
+                             is_dummy=algo_type == "dumb",
+                             feature_size=128,
+                             batch_size=128,
+                             input_length=input_length,
+                             device='cuda' if torch.cuda.is_available() else 'cpu')
+
+            algo.compile()
+
+            # Train iql
+            experiment_name = f"iql_{algo_type}_minigrid_lavagap_altstep"
+            algo.fit(
+                dataset,
+                n_steps=200_000,
+                n_steps_per_epoch=1_000,
+                evaluators={
+                    'environment': env_evaluator,
+                },
                 experiment_name=experiment_name,
                 show_progress=True,
             )
