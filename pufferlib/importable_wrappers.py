@@ -142,21 +142,37 @@ class MiniGridCNN(nn.Module):
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
             nn.ReLU(),
+            nn.Dropout2d(0.2),
+
             nn.Conv2d(16, 32, kernel_size=2),
             nn.ReLU(),
+            nn.Dropout2d(0.2),
+
             nn.Conv2d(32, 64, kernel_size=2),
             nn.ReLU(),
+            nn.Dropout2d(0.2),
+
             nn.Flatten(),
         )
         with torch.no_grad():
             n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
-        self.fc = nn.Sequential(nn.Linear(n_flat, feature_size), nn.ReLU())
+
+        self.fc = nn.Sequential(
+            nn.Linear(n_flat, feature_size),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
 
         if has_mlp:
-            self.mlp_maybe = nn.Sequential(nn.Linear(feature_size, feature_size // 2),
-                                           nn.Tanh(),
-                                           nn.Linear(feature_size // 2, feature_size // 2),
-                                           nn.Tanh())
+            self.mlp_maybe = nn.Sequential(
+                nn.Linear(feature_size, feature_size // 2),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+
+                nn.Linear(feature_size // 2, feature_size // 2),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            )
         else:
             self.mlp_maybe = lambda x: x
 
@@ -227,11 +243,18 @@ class CustomNet(nn.Module):
                                    has_mlp=False).to(device)
 
         self.lstm = nn.LSTM(feature_size, feature_size, batch_first=True).to(device)
-        self.decoder = nn.Sequential(nn.Linear(feature_size, feature_size // 2),
-                                     nn.Tanh(),
-                                     nn.Linear(feature_size // 2, feature_size // 2),
-                                     nn.Tanh(),
-                                     nn.Linear(feature_size // 2, output_size)).to(device)
+        self.post_lstm_dropout = nn.Dropout(0.2).to(device)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(feature_size, feature_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(feature_size // 2, feature_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(feature_size // 2, output_size)
+        ).to(device)
 
     def forward(self, x: torch.Tensor, masks: torch.Tensor = None, action: torch.Tensor = None) -> torch.Tensor:
         x, masks, action = self._ndarray_to_tensor(x, masks, action)
@@ -251,6 +274,7 @@ class CustomNet(nn.Module):
         # Unpack the padded sequences
         # (N, L, feature_size) -> (N, feature_size)
         x = self._unpack_sequence(x)
+        x = self.post_lstm_dropout(x)
 
         # (N, feature_size) -> (N, output_size)
         output = self.decoder(x)
@@ -299,6 +323,11 @@ class CustomNet(nn.Module):
             new_tensors.append(array.to(self._device))
 
         return new_tensors
+
+    def enable_mc_dropout(self, enabled: bool = True):
+        for m in self.modules():
+            if isinstance(m, (nn.Dropout, nn.Dropout2d)):
+                m.train(enabled)
 
 
 class CustomIQL(nn.Module):
@@ -661,7 +690,8 @@ class CustomEnvironmentEvaluator:
             while not done:
                 stacked_obs = np.stack(obs_queue, axis=0)[None, ...]
                 masks = np.array(mask_queue, dtype=np.float32)[None, ...]
-                action = algo.predict(stacked_obs, masks=masks)
+                with torch.no_grad():
+                    action = algo.predict(stacked_obs, masks=masks)
                 obs, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
                 total_reward += reward
@@ -670,7 +700,7 @@ class CustomEnvironmentEvaluator:
 
             mean_returns.append(total_reward)
 
-        return float(np.mean(mean_returns)), float(np.std(mean_returns))
+        return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
 
 
 def make_lavastep_env(**kwargs):
