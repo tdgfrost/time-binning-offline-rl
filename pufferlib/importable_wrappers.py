@@ -147,15 +147,12 @@ class MiniGridCNN(nn.Module):
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
             nn.ReLU(),
-            nn.Dropout2d(0.2),
 
             nn.Conv2d(16, 32, kernel_size=2),
             nn.ReLU(),
-            nn.Dropout2d(0.2),
 
             nn.Conv2d(32, 64, kernel_size=2),
             nn.ReLU(),
-            nn.Dropout2d(0.2),
 
             nn.Flatten(),
         )
@@ -165,18 +162,15 @@ class MiniGridCNN(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(n_flat, feature_size),
             nn.ReLU(),
-            nn.Dropout(0.2)
         )
 
         if has_mlp:
             self.mlp_maybe = nn.Sequential(
                 nn.Linear(feature_size, feature_size // 2),
                 nn.ReLU(),
-                nn.Dropout(0.2),
 
                 nn.Linear(feature_size // 2, feature_size // 2),
                 nn.ReLU(),
-                nn.Dropout(0.2)
             )
         else:
             self.mlp_maybe = lambda x: x
@@ -249,16 +243,13 @@ class CustomNet(nn.Module):
                                    has_mlp=False).to(device)
 
         self.lstm = nn.LSTM(feature_size, feature_size, batch_first=True).to(device)
-        self.post_lstm_dropout = nn.Dropout(0.2).to(device)
 
         self.decoder = nn.Sequential(
             nn.Linear(feature_size, feature_size // 2),
             nn.ReLU(),
-            nn.Dropout(0.2),
 
             nn.Linear(feature_size // 2, feature_size // 2),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(feature_size // 2, output_size)
         ).to(device)
 
@@ -280,7 +271,6 @@ class CustomNet(nn.Module):
         # Unpack the padded sequences
         # (N, L, feature_size) -> (N, feature_size)
         x = self._unpack_sequence(x)
-        x = self.post_lstm_dropout(x)
 
         # (N, feature_size) -> (N, output_size)
         output = self.decoder(x)
@@ -330,11 +320,6 @@ class CustomNet(nn.Module):
 
         return new_tensors
 
-    def enable_mc_dropout(self, enabled: bool = True):
-        for m in self.modules():
-            if isinstance(m, (nn.Dropout, nn.Dropout2d)):
-                m.train(enabled)
-
 
 class CustomIQL(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], action_size: int,  input_length: int = 2,
@@ -347,7 +332,7 @@ class CustomIQL(nn.Module):
         self._batch_size = batch_size
         self._expectile = expectile
         self._gamma = gamma
-        self._batch_weights = None
+        self._batch_diff = None
         self._input_length = input_length
         self._device = device
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, is_dummy=is_dummy,
@@ -436,8 +421,9 @@ class CustomIQL(nn.Module):
             q = torch.min(q1, q2)
 
         diff = q - v
-        self._batch_weights = torch.absolute(self._expectile - (diff < 0).float()).squeeze()
-        value_loss = (self._batch_weights * (diff.squeeze() ** 2)).mean()
+        self._batch_diff = diff.detach().squeeze()
+        weights = torch.absolute(self._expectile - (diff < 0).float()).squeeze()
+        value_loss = (weights * (diff.squeeze() ** 2)).mean()
 
         self.value_optim.zero_grad()
         value_loss.backward()
@@ -446,7 +432,9 @@ class CustomIQL(nn.Module):
 
     def _update_actor(self, obs, acts, masks):
         logits = self.policy_net(obs, masks)
-        policy_loss = (F.cross_entropy(logits, acts.squeeze().long(), reduction='none') * self._batch_weights).mean()
+        policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
+        policy_loss = (policy_loss * torch.exp(2.0 * self._batch_diff)).mean()
+
         self.policy_optim.zero_grad()
         policy_loss.backward()
         self.policy_optim.step()

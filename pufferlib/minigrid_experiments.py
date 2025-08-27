@@ -156,7 +156,7 @@ if __name__ == "__main__":
         # Load the dataset via d3rlpy's minari integration
         dataset, _ = d3rlpy.datasets.get_minari(dataset_id, trajectory_slicer=CustomTrajectorySlicer())
         dataset.sample_trajectory_batch = types.MethodType(sample_trajectory_batch, dataset)
-        input_length = 2  # For LSTM model
+        input_length = 8  # For LSTM model
         # Get the environment for later evaluation
         eval_env = minari.load_dataset(dataset_id).recover_environment()
         env_evaluator = CustomEnvironmentEvaluator(eval_env, n_trials=50, input_length=input_length)
