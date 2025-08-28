@@ -144,7 +144,9 @@ class MiniGridCNN(nn.Module):
             self.process_flag_maybe = nn.Sequential(
                 nn.Linear(1, feature_size // 2),
                 nn.ReLU(),
-                nn.Linear(feature_size // 2, feature_size)
+
+                nn.Linear(feature_size // 2, feature_size // 2),
+                nn.ReLU(),
             )
 
         self.cnn = nn.Sequential(
@@ -163,7 +165,7 @@ class MiniGridCNN(nn.Module):
             n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
 
         self.fc = nn.Sequential(
-            nn.Linear(n_flat, feature_size),
+            nn.Linear(n_flat, feature_size // 2),
             nn.ReLU(),
         )
 
@@ -182,7 +184,7 @@ class MiniGridCNN(nn.Module):
         x = self.permute_obs_maybe(x)
         x, x_flag = self.split_obs(x)
         x_flag = self.process_flag_maybe(x_flag)
-        return self.mlp_maybe(self.fc(self.cnn(x)) + x_flag)
+        return self.mlp_maybe(torch.concatenate((self.fc(self.cnn(x)), x_flag), dim=-1))
 
 
 class MinigridFeaturesExtractor(BaseFeaturesExtractor):

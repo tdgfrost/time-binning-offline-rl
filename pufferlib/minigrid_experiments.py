@@ -183,7 +183,7 @@ if __name__ == "__main__":
                 show_progress=True,
             )
 
-            full_eval_result = CustomEnvironmentEvaluator(eval_env, n_trials=500, input_length=input_length)(algo, dataset=None)
+            full_eval_result = CustomEnvironmentEvaluator(eval_env, n_trials=500, input_length=input_length)(algo)
 
             print(f"Overall result of {algo_type}: ", full_eval_result)
 
