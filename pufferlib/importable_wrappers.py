@@ -684,7 +684,7 @@ class CustomEnvironmentEvaluator:
 
 
 def make_lavastep_env(**kwargs):
-    env = gym.make("MiniGrid-LavaGapS7-v0", **kwargs)
+    env = gym.make("MiniGrid-LavaGapS5-v0", **kwargs)
     env = AlternateStepWrapper(env)
     env = RecordableImgObsWrapper(env)         # (H,W,C) uint8 image
     env = RepeatFlagChannel(env)     # +1 channel flag

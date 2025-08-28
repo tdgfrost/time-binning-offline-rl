@@ -21,7 +21,7 @@ render_performance = False
 
 
 register(
-    id="LavaGapS7AltStep-v0",
+    id="LavaGapS5AltStep-v0",
     entry_point="importable_wrappers:make_lavastep_env",
     # This metadata is what Minari will use to reconstruct later
     additional_wrappers=(
@@ -50,29 +50,32 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=128),
     )
 
-    env_name = "LavaGapS7AltStep-v0"
-    dataset_id = "minigrid_dataset/LavaGapS7AltStepMedium-v0"
+    env_name = "LavaGapS5AltStep-v0"
+    dataset_id = "minigrid_dataset/LavaGapS5AltStepMedium-v0"
     if train_ppo:
         # Create eval callback
         # callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=1.0, verbose=1)
         save_each_best = SaveEachBestCallback(save_dir="./ppo_minigrid_logs/historic_bests", verbose=1)
-        eval_callback = EvalCallback(gym.make(env_name),
+        eval_callback = EvalCallback(gym.make(env_name, max_episode_steps=100),
+                                     n_eval_episodes=50,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
+                                     deterministic=False,
                                      best_model_save_path="./ppo_minigrid_logs")
 
-        model = PPO("CnnPolicy", gym.make(env_name), policy_kwargs=policy_kwargs, verbose=1)
+        model = PPO("CnnPolicy", gym.make(env_name, max_episode_steps=100), ent_coef=0.1,
+                    policy_kwargs=policy_kwargs, verbose=1)
         model.learn(5e5, callback=eval_callback)  # Train for 500,000 step with early stopping
 
     if generate_dataset:
-        base_env = gym.make(env_name)
+        base_env = gym.make(env_name, max_episode_steps=50)
         recorded_env = DataCollector(base_env, record_infos=True, data_format="arrow")
 
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=170000_mean=49.8.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=30000_mean=0.50.zip',
                                  env=recorded_env, device="auto")
 
         # Collect episodes
-        target_frames = 500_000
+        target_frames = 100_000
         seed = 123
         ep_count = 0
         frame_count = 0
@@ -152,7 +155,7 @@ if __name__ == "__main__":
 
     if render_performance:
         # Managing your own trainer
-        eval_env = gym.make(env_name)
+        eval_env = gym.make(env_name, max_episode_steps=100)
         observation, info = eval_env.reset(seed=42)
         for _ in tqdm(range(1000)):
             action = model.predict(observation)[0]  # User-defined policy function
