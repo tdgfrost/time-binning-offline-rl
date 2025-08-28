@@ -136,83 +136,114 @@ class CallablePPO(PPO):
 
 
 class MiniGridCNN(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
-                 has_mlp=False, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        observation_shape: Tuple[int, int, int],
+        feature_size: int = 128,
+        is_dummy: bool = False,
+        has_mlp: bool = False,
+        use_padding_for_empty: bool = False,   # set True if id 0 should map to the zero vector
+        embed_dims: Tuple[int, int] = (8, 4),  # (d1 for 11-way, d2 for 6-way)
+        *args, **kwargs
+    ) -> None:
         super().__init__()
+
+        # Handle (H,W,C) vs (C,H,W)
         if observation_shape[-1] in (1, 4):
             H, W, C = observation_shape
-            self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)
+            self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)  # -> (N,C,H,W)
         else:
             C, H, W = observation_shape
-            self.permute_obs_maybe = lambda x: x
+            self.permute_obs_maybe = nn.Identity()
 
-        C -= 1  # we will ignore the last channel (the repeat flag)
-        self.split_obs = lambda x: (x[:, :C, :, :], x[:, -1, 0, 0].unsqueeze(-1))
-        if is_dummy:
-            self.process_flag_maybe = lambda x: torch.zeros_like(x)
-        else:
-            self.process_flag_maybe = nn.Sequential(
-                nn.Linear(1, feature_size // 2),
-                nn.ReLU(),
+        assert C == 4, f"Expected 4 channels, got {C}"
 
-                nn.Linear(feature_size // 2, feature_size // 2),
-                nn.ReLU(),
-            )
+        d1, d2 = embed_dims
+        d4 = feature_size
 
+        # Embedding tables
+        pad_idx_1 = 0 if use_padding_for_empty else None
+        self.emb1 = nn.Embedding(num_embeddings=11, embedding_dim=d1, padding_idx=pad_idx_1)
+        self.emb2 = nn.Embedding(num_embeddings=6, embedding_dim=d2, padding_idx=None)
+
+        # embed the global flag (2 categories) or you could MLP it as scalar
+        self.flag_emb = nn.Embedding(num_embeddings=2, embedding_dim=d4)
+        flag_out_dim = d4
+
+        # CNN over spatial embeddings
+        in_ch = d1 + d2  # per-cell spatial channels
         self.cnn = nn.Sequential(
-            nn.Conv2d(C, 16, kernel_size=2),
+            nn.Conv2d(in_ch, 16, kernel_size=2),
             nn.ReLU(),
-
             nn.Conv2d(16, 32, kernel_size=2),
             nn.ReLU(),
-
             nn.Conv2d(32, 64, kernel_size=2),
             nn.ReLU(),
-
             nn.Flatten(),
         )
         with torch.no_grad():
-            n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
+            n_flat = self.cnn(torch.zeros(1, in_ch, H, W)).shape[1]
 
         self.fc = nn.Sequential(
-            nn.Linear(n_flat, feature_size // 2),
-            nn.ReLU(),
+            nn.Linear(n_flat, feature_size)
         )
 
+        # Process global flag if needed
+        if is_dummy:
+            self.process_flag_maybe = lambda x: torch.zeros(x.size(0), flag_out_dim, device=x.device, dtype=x.dtype)
+        else:
+            self.process_flag_maybe = nn.Identity()
+
+        # Optional MLP head
         if has_mlp:
             self.mlp_maybe = nn.Sequential(
                 nn.Linear(feature_size, feature_size // 2),
                 nn.ReLU(),
-
                 nn.Linear(feature_size // 2, feature_size // 2),
                 nn.ReLU(),
             )
         else:
-            self.mlp_maybe = lambda x: x
+            self.mlp_maybe = nn.Identity()
 
-    @staticmethod
-    def scale_inputs(x):
-        """
-        To scale the four channels to 0-1 range:
-        1) 0 - 10 (OBJECT_IDX)
-        2) 0 - 5 (COLOR_IDX)
-        3) 0 (always)
-        4) 0-1 (repeat flag)
+        self.feature_size = feature_size
+        self.flag_out_dim = flag_out_dim
 
-        Assumes shape (N, C, H, W)
-        """
-        scaled_x = x.clone()
-        scaled_x[:, 0, :, :] /= 10.0
-        scaled_x[:, 1, :, :] /= 5.0
-        return scaled_x
-
+    def _split_channels(self, xCHW: torch.Tensor):
+        # xCHW: (N,4,H,W) of integer indices
+        x1 = xCHW[:, 0]   # (N,H,W) in {0..10}
+        x2 = xCHW[:, 1]   # (N,H,W) in {0..5}
+        x3 = xCHW[:, 2]   # (N,H,W) == 0 (ignored)
+        x4 = xCHW[:, 3]   # (N,H,W) in {0,1}
+        return x1, x2, x3, x4
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        permuted_x = self.permute_obs_maybe(x)
-        scaled_x = self.scale_inputs(permuted_x)
-        scaled_x, x_flag = self.split_obs(scaled_x)
-        hidden_x_flag = self.process_flag_maybe(x_flag)
-        return self.mlp_maybe(torch.concatenate((self.fc(self.cnn(scaled_x)), hidden_x_flag), dim=-1))
+        # Expect raw categorical indices, not scaled; can be float but will be cast to long safely
+        x = self.permute_obs_maybe(x)              # -> (N,4,H,W)
+        x = x.long().clamp_min(0)                  # safety: ensure indices non-negative
+
+        x1, x2, _x3, x4 = self._split_channels(x)  # (N,H,W)
+
+        # Per-cell embeddings
+        e1 = self.emb1(x1)                         # (N,H,W,d1)
+        e2 = self.emb2(x2)
+
+        # pool flag over space and embed as global feature
+        # (mean is robust; max would also work if it’s a presence flag)
+        f = x4.float().mean(dim=(1, 2)).round().long().clamp(0, 1)  # (N,)
+        e4_global = self.flag_emb(f)           # (N,d4)
+        hidden_flag = self.process_flag_maybe(e4_global)  # (N,d4 or 0)
+        # build spatial tensor without flag
+        spatial = torch.cat([e1, e2], dim=-1)  # (N,H,W,d1+d2)
+
+        # to (N,C,H,W)
+        spatial = spatial.permute(0, 3, 1, 2).contiguous()
+
+        # CNN + heads
+        z_spatial = self.fc(self.cnn(spatial))     # (N, feature_size//2)
+
+        out = F.relu(z_spatial + hidden_flag)
+
+        return self.mlp_maybe(out)
 
 
 class MinigridFeaturesExtractor(BaseFeaturesExtractor):
