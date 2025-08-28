@@ -59,9 +59,22 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         # super().__init__(env)
         self.step_mode = 0
 
+    def _update_step_reward(self, reward: float, term: bool) -> float:
+        # Simplify the reward to per-step basis
+        if term:
+            if reward > 0:
+                reward = 100
+            else:
+                reward = -100
+        # Currently, we'll comment the below out to make discounting simpler (keep intermediate rewards 0)
+        #else:
+            # reward = -1
+        return reward
+
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs1, reward1, term1, trunc1, info1 = self.env.step(action)
         term1, trunc1 = self.override_trunc(term1, trunc1)
+        reward1 = self._update_step_reward(reward1, term1)
 
         if term1 or trunc1:
             self.step_mode = 0
@@ -77,7 +90,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             obs2, reward2, term2, trunc2, info2 = self.env.step(action)
             term2, trunc2 = self.override_trunc(term2, trunc2)
             info1.update(info2)
-            full_reward = reward1 + reward2
+            full_reward = self._update_step_reward(reward1 + reward2, term2)
             if term2:
                 return obs2, float(full_reward), term2, trunc2, info1
 
@@ -86,7 +99,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             obs3, reward3, term3, trunc3, info3 = self.env.step(action)
             term3, trunc3 = self.override_trunc(term3, trunc3)
             info1.update(info3)
-            full_reward += reward3
+            full_reward = self._update_step_reward(full_reward + reward3, term3)
             return obs3, float(full_reward), term3, trunc3, info1
 
     def reset(self, *args, **kwargs) -> np.ndarray:
