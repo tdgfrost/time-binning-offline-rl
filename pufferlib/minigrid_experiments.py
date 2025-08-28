@@ -68,7 +68,7 @@ if __name__ == "__main__":
         base_env = gym.make(env_name)
         recorded_env = DataCollector(base_env, record_infos=True, data_format="arrow")
 
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_002_steps=100000_mean=0.38.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=170000_mean=49.8.zip',
                                  env=recorded_env, device="auto")
 
         # Collect episodes
@@ -106,50 +106,6 @@ if __name__ == "__main__":
         print("Total episodes collected: ", dataset.total_episodes)
         print("Total steps collected: ", dataset.total_steps)
 
-    if False: # train_iql:
-        # Load the dataset via d3rlpy's minari integration
-        dataset, _ = d3rlpy.datasets.get_minari(dataset_id)
-        # Get the environment for later evaluation
-        eval_env = minari.load_dataset(dataset_id).recover_environment()
-        env_evaluator = EnvironmentEvaluator(eval_env, n_trials=50)
-        # Set up IQL
-        for algo_type in ["smart", "dumb"]:
-            algo = DiscreteIQLConfig(batch_size=128,
-                                     # observation_scaler=StandardObservationScaler(),
-                                     actor_encoder_factory=MiniGridCNNFactory(feature_size=128,
-                                                                              is_dummy=algo_type == "dumb"),
-                                     value_encoder_factory=MiniGridCNNFactory(feature_size=128,
-                                                                              is_dummy=algo_type == "dumb"),
-                                     critic_encoder_factory=MiniGridCNNFactory(feature_size=128,
-                                                                              is_dummy=algo_type == "dumb"),
-                                     expectile=0.8,
-                                     ).create()
-
-            # Train iql
-            experiment_name = f"iql_{algo_type}_minigrid_lavagap_altstep"
-            algo.fit(
-                dataset,
-                n_steps=200_000,
-                n_steps_per_epoch=1_000,
-                evaluators={
-                    'environment': env_evaluator,
-                },
-                callback=None,
-                experiment_name=experiment_name,
-                show_progress=True,
-            )
-
-            full_eval_result = EnvironmentEvaluator(eval_env, n_trials=500)(algo, dataset=None)
-
-            print(f"Overall result of {algo_type}: ", full_eval_result)
-
-            # Get full directory name
-            experiment_dir = glob.glob(f"./d3rlpy_logs/{experiment_name}_*")[0]
-            with open(os.path.join(experiment_dir, "final_eval.txt"), "w") as f:
-                f.write(str(full_eval_result))
-
-        # algo = d3rlpy.load_learnable(f"./d3rlpy_logs/cql_smart_minigrid_lavagap_altstep_20250822181226/model_20000.d3")
-
     if train_iql:
         # Load the dataset via d3rlpy's minari integration
         dataset, _ = d3rlpy.datasets.get_minari(dataset_id, trajectory_slicer=CustomTrajectorySlicer())
@@ -157,7 +113,7 @@ if __name__ == "__main__":
         input_length = 8  # For LSTM model
         # Get the environment for later evaluation
         eval_env = minari.load_dataset(dataset_id).recover_environment()
-        env_evaluator = CustomEnvironmentEvaluator(eval_env, n_trials=50, input_length=input_length)
+        env_evaluator = CustomEnvironmentEvaluator(eval_env, n_trials=50)
         # Set up IQL
         for algo_type in ["smart", "dumb"]:
             algo = CustomIQL(observation_shape=eval_env.observation_space.shape,
@@ -165,7 +121,6 @@ if __name__ == "__main__":
                              is_dummy=algo_type == "dumb",
                              feature_size=128,
                              batch_size=128,
-                             input_length=input_length,
                              device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
@@ -183,7 +138,7 @@ if __name__ == "__main__":
                 show_progress=True,
             )
 
-            full_eval_result = CustomEnvironmentEvaluator(eval_env, n_trials=500, input_length=input_length)(algo)
+            full_eval_result = CustomEnvironmentEvaluator(eval_env, n_trials=500)(algo)
 
             print(f"Overall result of {algo_type}: ", full_eval_result)
 
