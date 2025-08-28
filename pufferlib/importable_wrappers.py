@@ -60,32 +60,34 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         self.step_mode = 0
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs1, reward1, terminated1, truncated1, info1 = self.env.step(action)
-        terminated1, truncated1 = self.mutually_exclusive_done(terminated1, truncated1)
+        obs1, reward1, term1, trunc1, info1 = self.env.step(action)
+        term1, trunc1 = self.override_trunc(term1, trunc1)
 
-        if terminated1 or truncated1:
+        if term1 or trunc1:
             self.step_mode = 0
 
         if self.step_mode == 0:
             info1['bonus_step_taken'] = False
             self.step_mode = 1
-            return obs1, float(reward1), terminated1, truncated1, info1
+            return obs1, float(reward1), term1, trunc1, info1
         else:
             info1['bonus_step_taken'] = True
             self.step_mode = 0
-            obs2, reward2, terminated2, truncated2, info2 = self.env.step(action)
-            terminated2, truncated2 = self.mutually_exclusive_done(terminated2, truncated2)
+            self.unwrapped.step_count -= 1
+            obs2, reward2, term2, trunc2, info2 = self.env.step(action)
+            term2, trunc2 = self.override_trunc(term2, trunc2)
             info1.update(info2)
             full_reward = reward1 + reward2
-            if terminated2 or truncated2:
-                return obs2, float(full_reward), terminated2, truncated2, info1
+            if term2:
+                return obs2, float(full_reward), term2, trunc2, info1
 
             # If we are still not done, we return the second observation
-            obs3, reward3, terminated3, truncated3, info3 = self.env.step(action)
-            terminated3, truncated3 = self.mutually_exclusive_done(terminated3, truncated3)
+            self.unwrapped.step_count -= 1
+            obs3, reward3, term3, trunc3, info3 = self.env.step(action)
+            term3, trunc3 = self.override_trunc(term3, trunc3)
             info1.update(info3)
             full_reward += reward3
-            return obs3, float(full_reward), terminated3, truncated3, info1
+            return obs3, float(full_reward), term3, trunc3, info1
 
     def reset(self, *args, **kwargs) -> np.ndarray:
         self.step_mode = 0
@@ -94,9 +96,10 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         return obs, info
 
     @staticmethod
-    def mutually_exclusive_done(term: bool, trunc: bool) -> Tuple[bool, bool]:
-        # Apparently required for compatibility with d3rlpy
-        if term:
+    def override_trunc(term: bool, trunc: bool) -> Tuple[bool, bool]:
+        # Apparently required for compatibility with d3rlpy - must be mutually exclusive, and only registers
+        # episodes as terminated if the `term` flag is positive.
+        if trunc:
             return True, False
         return term, trunc
 

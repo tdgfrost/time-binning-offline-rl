@@ -74,7 +74,6 @@ if __name__ == "__main__":
         # Collect episodes
         target_frames = 500_000
         seed = 123
-        n_frames = 0
         ep_count = 0
         frame_count = 0
         stop_loop = False
@@ -90,10 +89,9 @@ if __name__ == "__main__":
                     action, _ = model.predict(obs)
                     obs, reward, terminated, truncated, info = recorded_env.step(action)
                     done = terminated or truncated
-                    n_frames += 1
                     pbar.update(1)
-                    if n_frames >= target_frames:
-                        print(f"Reached {n_frames} frames, stopping data collection.")
+                    if frame_count >= target_frames:
+                        print(f"Reached {frame_count} frames, stopping data collection.")
                         stop_loop = True
                         break
 
@@ -185,15 +183,16 @@ if __name__ == "__main__":
                 show_progress=True,
             )
 
-            full_eval_result = EnvironmentEvaluator(eval_env, n_trials=500)(algo, dataset=None)
+            full_eval_result = CustomEnvironmentEvaluator(eval_env, n_trials=500, input_length=input_length)(algo, dataset=None)
 
             print(f"Overall result of {algo_type}: ", full_eval_result)
 
             # Get full directory name
+            """
             experiment_dir = glob.glob(f"./d3rlpy_logs/{experiment_name}_*")[0]
             with open(os.path.join(experiment_dir, "final_eval.txt"), "w") as f:
                 f.write(str(full_eval_result))
-
+            """
         # algo = d3rlpy.load_learnable(f"./d3rlpy_logs/cql_smart_minigrid_lavagap_altstep_20250822181226/model_20000.d3")
 
     if render_performance:
