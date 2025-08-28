@@ -27,7 +27,7 @@ from collections import deque
 
 class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     """
-    Original obs shape (7, 7, 3). Append a 1-channel flag to make (7, 7, 4).
+    Original obs shape (5, 5, 3). Append a 1-channel flag to make (5, 5, 4).
     0 -> next action repeats once; 1 -> next action repeats twice.
     """
     def __init__(self, env):
@@ -52,65 +52,66 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     'bonus' step using the same action.
     """
 
-    def __init__(self, env: gym.Env) -> None:
+    def __init__(self, env: gym.Env, max_steps: int = 100) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
         # super().__init__(env)
         self.step_mode = 0
-
-    def _update_step_reward(self, reward: float, term: bool) -> float:
-        # Simplify the reward to per-step basis
-        if term:
-            if reward > 0:
-                reward = 1
-        else:
-            reward = 0
-        return reward
+        self.step_count = 0
+        self.max_steps = max_steps
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs1, reward1, term1, trunc1, info1 = self.env.step(action)
-        term1, trunc1 = self.override_trunc(term1, trunc1)
-        reward1 = self._update_step_reward(reward1, term1)
+        obs1, reward1, term1, _, info1 = self.env.step(action)
+        self.step_count += 1
+        trunc = self.get_trunc()
+        reward1 = self._update_step_reward(reward1)
 
-        if term1 or trunc1:
+        if term1:
             self.step_mode = 0
 
         if self.step_mode == 0:
             info1['bonus_step_taken'] = False
             self.step_mode = 1
-            return obs1, float(reward1), term1, trunc1, info1
+            return obs1, float(reward1), (term1 or trunc), False, info1
         else:
             info1['bonus_step_taken'] = True
             self.step_mode = 0
-            self.unwrapped.step_count -= 1
-            obs2, reward2, term2, trunc2, info2 = self.env.step(action)
-            term2, trunc2 = self.override_trunc(term2, trunc2)
-            info1.update(info2)
-            full_reward = self._update_step_reward(reward1 + reward2, term2)
-            if term2:
-                return obs2, float(full_reward), term2, trunc2, info1
 
-            # If we are still not done, we return the second observation
+            # Second step:
             self.unwrapped.step_count -= 1
-            obs3, reward3, term3, trunc3, info3 = self.env.step(action)
-            term3, trunc3 = self.override_trunc(term3, trunc3)
+            obs2, reward2, term2, _, info2 = self.env.step(action)
+            info1.update(info2)
+            reward2 = self._update_step_reward(reward2)
+            if term2:
+                return obs2, float(reward2), term2, False, info1
+
+            # Third step:
+            self.unwrapped.step_count -= 1
+            obs3, reward3, term3, _, info3 = self.env.step(action)
             info1.update(info3)
-            full_reward = self._update_step_reward(full_reward + reward3, term3)
-            return obs3, float(full_reward), term3, trunc3, info1
+            reward3 = self._update_step_reward(reward3)
+            return obs3, float(reward3), (term3 or trunc), False, info1
+
+    def get_trunc(self):
+        # This is used to set term, NOT trunc
+        if self.step_count >= self.max_steps:
+            return True
+        return False
+
+    @staticmethod
+    def _update_step_reward(reward: float) -> float:
+        # Simplify the reward to per-step basis
+        if reward > 0:
+            return 1.0
+        return 0.0
 
     def reset(self, *args, **kwargs) -> np.ndarray:
         self.step_mode = 0
+        self.step_count = 0
         obs, info = self.env.reset(*args, **kwargs)
         info['bonus_step_taken'] = False
         return obs, info
 
-    @staticmethod
-    def override_trunc(term: bool, trunc: bool) -> Tuple[bool, bool]:
-        # Apparently required for compatibility with d3rlpy - must be mutually exclusive, and only registers
-        # episodes as terminated if the `term` flag is positive.
-        if trunc:
-            return True, False
-        return term, trunc
 
 class RecordableImgObsWrapper(RecordConstructorArgs, ImgObsWrapper):
     """
@@ -683,9 +684,9 @@ class CustomEnvironmentEvaluator:
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
 
 
-def make_lavastep_env(**kwargs):
-    env = gym.make("MiniGrid-LavaGapS5-v0", **kwargs)
-    env = AlternateStepWrapper(env)
+def make_lavastep_env(*, max_steps=100, **kwargs):
+    env = gym.make("MiniGrid-LavaGapS5-v0", max_episode_steps=None)
+    env = AlternateStepWrapper(env, max_steps=max_steps)
     env = RecordableImgObsWrapper(env)         # (H,W,C) uint8 image
     env = RepeatFlagChannel(env)     # +1 channel flag
     return env

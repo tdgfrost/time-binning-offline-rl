@@ -19,6 +19,8 @@ generate_dataset = False
 train_iql = True
 render_performance = False
 
+GAMMA = 0.99
+
 
 register(
     id="LavaGapS5AltStep-v0",
@@ -56,22 +58,22 @@ if __name__ == "__main__":
         # Create eval callback
         # callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=1.0, verbose=1)
         save_each_best = SaveEachBestCallback(save_dir="./ppo_minigrid_logs/historic_bests", verbose=1)
-        eval_callback = EvalCallback(gym.make(env_name, max_episode_steps=100),
+        eval_callback = EvalCallback(gym.make(env_name, max_steps=100),
                                      n_eval_episodes=50,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
                                      deterministic=False,
                                      best_model_save_path="./ppo_minigrid_logs")
 
-        model = PPO("CnnPolicy", gym.make(env_name, max_episode_steps=100), ent_coef=0.1,
-                    policy_kwargs=policy_kwargs, verbose=1)
+        model = PPO("CnnPolicy", gym.make(env_name, max_steps=100), ent_coef=0.1,
+                    policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1)
         model.learn(5e5, callback=eval_callback)  # Train for 500,000 step with early stopping
 
     if generate_dataset:
-        base_env = gym.make(env_name, max_episode_steps=50)
+        base_env = gym.make(env_name, max_steps=50)
         recorded_env = DataCollector(base_env, record_infos=True, data_format="arrow")
 
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=30000_mean=0.50.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_002_steps=20000_mean=0.50.zip',
                                  env=recorded_env, device="auto")
 
         # Collect episodes
@@ -91,7 +93,7 @@ if __name__ == "__main__":
                     model.set_random_seed(seed + frame_count)
                     action, _ = model.predict(obs)
                     obs, reward, terminated, truncated, info = recorded_env.step(action)
-                    done = terminated or truncated
+                    done = terminated or truncated  # should never be truncated
                     pbar.update(1)
                     if frame_count >= target_frames:
                         print(f"Reached {frame_count} frames, stopping data collection.")
@@ -124,6 +126,7 @@ if __name__ == "__main__":
                              is_dummy=algo_type == "dumb",
                              feature_size=128,
                              batch_size=128,
+                             gamma=GAMMA,
                              device='cuda' if torch.cuda.is_available() else 'cpu')
 
             algo.compile()
@@ -155,7 +158,7 @@ if __name__ == "__main__":
 
     if render_performance:
         # Managing your own trainer
-        eval_env = gym.make(env_name, max_episode_steps=100)
+        eval_env = gym.make(env_name, max_steps=100)
         observation, info = eval_env.reset(seed=42)
         for _ in tqdm(range(1000)):
             action = model.predict(observation)[0]  # User-defined policy function
