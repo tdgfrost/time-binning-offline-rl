@@ -2,6 +2,7 @@ from typing import Tuple, Dict, Any, Union
 import numpy as np
 from gymnasium import spaces, ObservationWrapper
 import gymnasium as gym
+from gymnasium.spaces import Box
 from gymnasium.utils import RecordConstructorArgs
 from minigrid.wrappers import ImgObsWrapper, Wrapper
 from stable_baselines3 import PPO
@@ -43,7 +44,7 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     def observation(self, obs):
         val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
         flag = np.full((obs.shape[0], obs.shape[1], 1), val, dtype=np.uint8)
-        return np.concatenate([obs, flag], axis=-1)
+        return np.concatenate([flag, obs], axis=-1)
 
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
@@ -120,7 +121,17 @@ class RecordableImgObsWrapper(RecordConstructorArgs, ImgObsWrapper):
     def __init__(self, env):
         RecordConstructorArgs.__init__(self)
         ImgObsWrapper.__init__(self, env)
-        # super().__init__(env)
+        assert isinstance(env.observation_space['image'], spaces.Box)
+        h, w, c = env.observation_space["image"].shape
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(h, w, c + 1), dtype=np.uint8
+        )
+
+    def observation(self, obs):
+        target_shape = obs['image'].shape
+        target_dtype = obs['image'].dtype
+        return np.concatenate((np.full(target_shape[:-1] + (1,), fill_value=obs['direction'], dtype=target_dtype),
+                               obs["image"]), -1)
 
 
 class CallablePPO(PPO):
@@ -136,29 +147,18 @@ class CallablePPO(PPO):
 
 
 class PPOMiniGridCNN(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
+    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128,
                  *args, **kwargs) -> None:
         super().__init__()
-        if observation_shape[-1] in (1, 4):
+        if observation_shape[-1] in (1, 5):
             H, W, C = observation_shape
             self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)
         else:
             C, H, W = observation_shape
             self.permute_obs_maybe = lambda x: x
 
-        C -= 2  # we will ignore the third channel (the always-0 channel in LavaGap)
-        self.split_obs = lambda x: (x[:, :C, :, :], x[:, -1, 0, 0].unsqueeze(-1))
-
-        if is_dummy:
-            self.process_flag_maybe = lambda x: torch.zeros_like(x)
-        else:
-            self.process_flag_maybe = nn.Sequential(
-                nn.Linear(1, feature_size // 2),
-                nn.ReLU(),
-
-                nn.Linear(feature_size // 2, feature_size // 2),
-                nn.ReLU(),
-            )
+        C -= 1  # we will ignore the final channel (the always-0 channel in LavaGap)
+        self.shrink_obs = lambda x: x[:, :C, :, :]
 
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
@@ -180,27 +180,25 @@ class PPOMiniGridCNN(nn.Module):
             nn.ReLU(),
         )
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         permuted_x = self.permute_obs_maybe(x)
-        permuted_x, x_flag = self.split_obs(permuted_x)
-        hidden_x_flag = self.process_flag_maybe(x_flag)
-        return torch.concatenate((self.fc(self.cnn(permuted_x)), hidden_x_flag), dim=-1)
+        permuted_x = self.shrink_obs(permuted_x)
+        return self.fc(self.cnn(permuted_x))
 
 
 class OfflineMiniGridCNN(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
+    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128,
                  input_scaling: bool = False, *args, **kwargs) -> None:
         super().__init__()
-        if observation_shape[-1] in (1, 4):
+        if observation_shape[-1] in (1, 5):
             H, W, C = observation_shape
             self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)
         else:
             C, H, W = observation_shape
             self.permute_obs_maybe = lambda x: x
 
-        C -= 2  # we will ignore the last channel (the repeat flag)
-        self.shrink_obs = lambda x: x[:, :C, :, :]
+        C -= 2  # we will ignore the flag (processed separately) AND the last channel (always 0 in LavaGap)
+        self.shrink_obs = lambda x: x[:, 1:C+1, :, :]
 
         if input_scaling:
             self.scale_inputs_maybe = self.scale_inputs
@@ -230,17 +228,19 @@ class OfflineMiniGridCNN(nn.Module):
     @staticmethod
     def scale_inputs(x):
         """
-        To scale the four channels to 0-1 range:
-        1) 0 - 10 (OBJECT_IDX)
-        2) 0 - 5 (COLOR_IDX)
-        3) 0 (always)
-        4) 0-1 (repeat flag)
+        To scale the channels to 0-1 range:
+        0) 0-1 (repeat flag)
+        1) 0-3 (direction)
+        2) 0 - 10 (OBJECT_IDX)
+        3) 0 - 5 (COLOR_IDX)
+        4) 0 (always)
 
         Assumes shape (N, C, H, W)
         """
         scaled_x = x.clone()
-        scaled_x[:, 0, :, :] /= 10.0
-        scaled_x[:, 1, :, :] /= 5.0
+        scaled_x[:, 1, :, :] /= 3.0
+        scaled_x[:, 2, :, :] /= 10.0
+        scaled_x[:, 3, :, :] /= 5.0
         return scaled_x
 
 
@@ -290,9 +290,7 @@ class CustomNet(nn.Module):
         self._device = device
         if feature_extractor is None:
             self.encoder = OfflineMiniGridCNN(observation_shape=observation_shape,
-                                              feature_size=feature_size,
-                                              is_dummy=is_dummy,
-                                              has_mlp=False).to(device)
+                                              feature_size=feature_size).to(device)
         else:
             self.encoder = feature_extractor
 
@@ -351,8 +349,7 @@ class CustomIQL(nn.Module):
         self._batch_diff = None
         self._input_length = input_length
         self._device = device
-        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, is_dummy=is_dummy,
-                          device=device)
+        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, device=device)
 
         self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
 
@@ -486,7 +483,9 @@ class CustomIQL(nn.Module):
     def _extract_flag(self, obs):
         if self._is_dummy:
             return None
-        return obs[:, -1, -1, -1].unsqueeze(-1).long()
+        if obs.shape[-1] in (1, 5):
+            return obs[:, -1, -1, 0].unsqueeze(-1).long()
+        return obs[:, 0, -1, -1].unsqueeze(-1).long()
 
     def _to_tensors(self, *arrays):
         new_tensors = []
@@ -720,7 +719,7 @@ class CustomEnvironmentEvaluator:
 
 
 def make_lavastep_env(*, max_steps=100, **kwargs):
-    env = gym.make("MiniGrid-LavaGapS5-v0", max_episode_steps=None)
+    env = gym.make("MiniGrid-LavaGapS5-v0", max_episode_steps=None, **kwargs)
     env = AlternateStepWrapper(env, max_steps=max_steps)
     env = RecordableImgObsWrapper(env)         # (H,W,C) uint8 image
     env = RepeatFlagChannel(env)     # +1 channel flag

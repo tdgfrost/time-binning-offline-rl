@@ -73,7 +73,7 @@ if __name__ == "__main__":
         base_env = gym.make(env_name, max_steps=50)
         recorded_env = DataCollector(base_env, record_infos=True, data_format="arrow")
 
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_002_steps=20000_mean=0.50.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=30000_mean=0.88.zip',
                                  env=recorded_env, device="auto")
 
         # Collect episodes
@@ -158,7 +158,9 @@ if __name__ == "__main__":
 
     if render_performance:
         # Managing your own trainer
-        eval_env = gym.make(env_name, max_steps=100)
+        eval_env = gym.make(env_name, max_steps=100, render_mode="human")
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_003_steps=30000_mean=0.88.zip',
+                                 env=eval_env, device="auto")
         observation, info = eval_env.reset(seed=42)
         for _ in tqdm(range(1000)):
             action = model.predict(observation)[0]  # User-defined policy function
