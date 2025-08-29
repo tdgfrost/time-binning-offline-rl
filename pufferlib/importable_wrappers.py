@@ -162,12 +162,15 @@ class PPOMiniGridCNN(nn.Module):
 
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
+            nn.GroupNorm(1, 16),
             nn.ReLU(),
 
             nn.Conv2d(16, 32, kernel_size=2),
+            nn.GroupNorm(1, 32),
             nn.ReLU(),
 
             nn.Conv2d(32, 64, kernel_size=2),
+            nn.GroupNorm(1, 64),
             nn.ReLU(),
 
             nn.Flatten(),
@@ -177,6 +180,7 @@ class PPOMiniGridCNN(nn.Module):
 
         self.fc = nn.Sequential(
             nn.Linear(n_flat, feature_size),
+            nn.LayerNorm(feature_size),
             nn.ReLU(),
         )
 
@@ -207,12 +211,15 @@ class OfflineMiniGridCNN(nn.Module):
 
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
+            nn.GroupNorm(1, 16),
             nn.ReLU(),
 
             nn.Conv2d(16, 32, kernel_size=2),
+            nn.GroupNorm(1, 32),
             nn.ReLU(),
 
             nn.Conv2d(32, 64, kernel_size=2),
+            nn.GroupNorm(1, 64),
             nn.ReLU(),
 
             nn.Flatten(),
@@ -222,6 +229,7 @@ class OfflineMiniGridCNN(nn.Module):
 
         self.fc = nn.Sequential(
             nn.Linear(n_flat, feature_size),
+            nn.LayerNorm(feature_size),
             nn.ReLU(),
         )
 
@@ -296,10 +304,13 @@ class CustomNet(nn.Module):
 
         self.decoder = nn.Sequential(
             nn.Linear(feature_size, feature_size // 2),
+            nn.LayerNorm(feature_size // 2),
             nn.ReLU(),
 
             nn.Linear(feature_size // 2, feature_size // 2),
+            nn.LayerNorm(feature_size // 2),
             nn.ReLU(),
+
             nn.Linear(feature_size // 2, output_size)
         ).to(device)
 
@@ -415,24 +426,24 @@ class CustomIQL(nn.Module):
     def forward(self, obs, acts, flag=None):
         if flag is None:
             flag = self._extract_flag(obs)
-        q1, q2 = self.critic_net1(obs, acts, flag), self.critic_net2(obs, acts, flag)
-        v = self.value_net(obs, flag)
-        logits = self.policy_net(obs, flag)
+        q1, q2 = self.critic_net1(obs, acts, flag=flag), self.critic_net2(obs, acts, flag=flag)
+        v = self.value_net(obs, flag=flag)
+        logits = self.policy_net(obs, flag=flag)
         return (q1, q2), v, logits
 
     def predict(self, obs, flag=None, deterministic: bool = False):
         if flag is None:
             flag = self._extract_flag(obs)
-        logits = self.policy_net(obs, flag)
+        logits = self.policy_net(obs, flag=flag)
         if deterministic:
             return logits.argmax(dim=-1).cpu().numpy()
         return Categorical(logits=logits).sample().cpu().numpy()
 
     def _update_critic(self, obs, acts, rews, next_obs, dones, flag=None):
-        q1, q2 = self.critic_net1(obs, acts, flag), self.critic_net2(obs, acts, flag)
+        q1, q2 = self.critic_net1(obs, acts, flag=flag), self.critic_net2(obs, acts, flag=flag)
         with torch.no_grad():
             next_flag = self._extract_flag(next_obs)
-            v_next = self.target_value_net(next_obs, next_flag)
+            v_next = self.target_value_net(next_obs, flag=next_flag)
             flag = torch.where(flag == 1, 3, 1)
             q_target = rews + self._gamma ** flag * (1 - dones) * v_next
 
@@ -443,9 +454,9 @@ class CustomIQL(nn.Module):
         return loss.item()
 
     def _update_value(self, obs, acts, flag=None):
-        v = self.value_net(obs, flag)
+        v = self.value_net(obs, flag=flag)
         with torch.no_grad():
-            q1, q2 = self.critic_net1(obs, acts, flag), self.critic_net2(obs, acts, flag)
+            q1, q2 = self.critic_net1(obs, acts, flag=flag), self.critic_net2(obs, acts, flag=flag)
             q = torch.min(q1, q2)
 
         diff = q - v
@@ -459,7 +470,7 @@ class CustomIQL(nn.Module):
         return value_loss.item()
 
     def _update_actor(self, obs, acts, flag=None):
-        logits = self.policy_net(obs, flag)
+        logits = self.policy_net(obs, flag=flag)
         weights = self._batch_diff
         weights = (weights - weights.mean()) / (weights.std() + 1e-6)
         policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
@@ -481,6 +492,7 @@ class CustomIQL(nn.Module):
         return obs, acts, rews, next_obs, dones, flag
 
     def _extract_flag(self, obs):
+        obs = self._to_tensors(obs)[0]
         if self._is_dummy:
             return None
         if obs.shape[-1] in (1, 5):
