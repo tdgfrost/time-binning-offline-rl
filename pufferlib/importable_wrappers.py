@@ -41,7 +41,7 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         )
 
     def observation(self, obs):
-        val = 0 if self.env.get_wrapper_attr("step_mode") == 1 else 1 # 0 for no repeat, 1 for repeat
+        val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
         flag = np.full((obs.shape[0], obs.shape[1], 1), val, dtype=np.uint8)
         return np.concatenate([obs, flag], axis=-1)
 
@@ -135,9 +135,9 @@ class CallablePPO(PPO):
         return action
 
 
-class MiniGridCNN(nn.Module):
+class PPOMiniGridCNN(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
-                 has_mlp=False, *args, **kwargs) -> None:
+                 *args, **kwargs) -> None:
         super().__init__()
         if observation_shape[-1] in (1, 4):
             H, W, C = observation_shape
@@ -146,8 +146,9 @@ class MiniGridCNN(nn.Module):
             C, H, W = observation_shape
             self.permute_obs_maybe = lambda x: x
 
-        C -= 1  # we will ignore the last channel (the repeat flag)
+        C -= 2  # we will ignore the third channel (the always-0 channel in LavaGap)
         self.split_obs = lambda x: (x[:, :C, :, :], x[:, -1, 0, 0].unsqueeze(-1))
+
         if is_dummy:
             self.process_flag_maybe = lambda x: torch.zeros_like(x)
         else:
@@ -175,20 +176,56 @@ class MiniGridCNN(nn.Module):
             n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
 
         self.fc = nn.Sequential(
-            nn.Linear(n_flat, feature_size // 2),
+            nn.Linear(n_flat, feature_size),
             nn.ReLU(),
         )
 
-        if has_mlp:
-            self.mlp_maybe = nn.Sequential(
-                nn.Linear(feature_size, feature_size // 2),
-                nn.ReLU(),
 
-                nn.Linear(feature_size // 2, feature_size // 2),
-                nn.ReLU(),
-            )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        permuted_x = self.permute_obs_maybe(x)
+        permuted_x, x_flag = self.split_obs(permuted_x)
+        hidden_x_flag = self.process_flag_maybe(x_flag)
+        return torch.concatenate((self.fc(self.cnn(permuted_x)), hidden_x_flag), dim=-1)
+
+
+class OfflineMiniGridCNN(nn.Module):
+    def __init__(self, observation_shape: Tuple[int, int, int], feature_size: int = 128, is_dummy=False,
+                 input_scaling: bool = False, *args, **kwargs) -> None:
+        super().__init__()
+        if observation_shape[-1] in (1, 4):
+            H, W, C = observation_shape
+            self.permute_obs_maybe = lambda x: x.permute(0, 3, 1, 2)
         else:
-            self.mlp_maybe = lambda x: x
+            C, H, W = observation_shape
+            self.permute_obs_maybe = lambda x: x
+
+        C -= 2  # we will ignore the last channel (the repeat flag)
+        self.shrink_obs = lambda x: x[:, :C, :, :]
+
+        if input_scaling:
+            self.scale_inputs_maybe = self.scale_inputs
+        else:
+            self.scale_inputs_maybe = lambda x: x
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(C, 16, kernel_size=2),
+            nn.ReLU(),
+
+            nn.Conv2d(16, 32, kernel_size=2),
+            nn.ReLU(),
+
+            nn.Conv2d(32, 64, kernel_size=2),
+            nn.ReLU(),
+
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
+
+        self.fc = nn.Sequential(
+            nn.Linear(n_flat, feature_size),
+            nn.ReLU(),
+        )
 
     @staticmethod
     def scale_inputs(x):
@@ -209,38 +246,19 @@ class MiniGridCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         permuted_x = self.permute_obs_maybe(x)
-        scaled_x = self.scale_inputs(permuted_x)
-        scaled_x, x_flag = self.split_obs(scaled_x)
-        hidden_x_flag = self.process_flag_maybe(x_flag)
-        return self.mlp_maybe(torch.concatenate((self.fc(self.cnn(scaled_x)), hidden_x_flag), dim=-1))
+        scaled_x = self.scale_inputs_maybe(permuted_x)
+        scaled_x = self.shrink_obs(scaled_x)
+        return self.fc(self.cnn(scaled_x))
 
 
 class MinigridFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.Space, features_dim: int = 512) -> None: #, normalized_image: bool = False) -> None:
         super().__init__(observation_space, features_dim)
-        self.net = MiniGridCNN(observation_space.shape, feature_size=features_dim)
+        self.net = PPOMiniGridCNN(observation_space.shape, feature_size=features_dim)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.net(observations)
 
-
-@dataclasses.dataclass()
-class MiniGridCNNFactory(d3rlpy.models.encoders.EncoderFactory):
-    is_dummy: bool = False
-    has_mlp: bool = True
-    feature_size: int = 128
-
-    def create(self, observation_shape: Sequence[int]) -> nn.Module:
-        return MiniGridCNN(tuple(observation_shape), feature_size=self.feature_size, is_dummy=self.is_dummy,
-                           has_mlp=self.has_mlp)
-
-    @staticmethod
-    def get_type() -> str:
-        return "minigrid_cnn"
-
-
-# Register in d3rlpy (so the model can be saved/loaded)
-register_encoder_factory(MiniGridCNNFactory)
 
 class SaveEachBestCallback(BaseCallback):
     """Called by EvalCallback when a new best model is found."""
@@ -271,10 +289,10 @@ class CustomNet(nn.Module):
         super().__init__()
         self._device = device
         if feature_extractor is None:
-            self.encoder = MiniGridCNN(observation_shape=observation_shape,
-                                       feature_size=feature_size,
-                                       is_dummy=is_dummy,
-                                       has_mlp=False).to(device)
+            self.encoder = OfflineMiniGridCNN(observation_shape=observation_shape,
+                                              feature_size=feature_size,
+                                              is_dummy=is_dummy,
+                                              has_mlp=False).to(device)
         else:
             self.encoder = feature_extractor
 
@@ -287,14 +305,19 @@ class CustomNet(nn.Module):
             nn.Linear(feature_size // 2, output_size)
         ).to(device)
 
-    def forward(self, x: torch.Tensor, action: torch.Tensor = None) -> torch.Tensor:
-        x, action = self._ndarray_to_tensor(x, action)
+    def forward(self, x: torch.Tensor, action: torch.Tensor = None, flag: torch.Tensor = None) -> torch.Tensor:
+        x, action, flag = self._ndarray_to_tensor(x, action, flag)
 
         # (N, C, H, W) -> (N, feature_size)
         hidden = self.encoder(x)
 
         # (N, feature_size) -> (N, output_size)
         output = self.decoder(hidden)
+
+        if flag is not None:
+            output = output.view(x.size(0), 2, -1)
+            output = torch.take_along_dim(output, flag.unsqueeze(-1), 1).squeeze(1)
+
         if action is None:
             return output
 
@@ -331,13 +354,15 @@ class CustomIQL(nn.Module):
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, is_dummy=is_dummy,
                           device=device)
 
-        self.feature_extractor = MiniGridCNN(**net_kwargs).to(device)
+        self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
 
-        self.critic_net1 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_value_net = CustomNet(output_size=1, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.policy_net = CustomNet(output_size=action_size, feature_extractor=self.feature_extractor, **net_kwargs)
+        _expand_output = (not is_dummy) + 1
+
+        self.critic_net1 = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.value_net = CustomNet(output_size=1 * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_value_net = CustomNet(output_size=1 * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.policy_net = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
 
         # Give both critic nets to the critic optimizer
         self.critic_optim = torch.optim.Adam(list(self.critic_net1.encoder.parameters()) +
@@ -371,12 +396,12 @@ class CustomIQL(nn.Module):
                     leave=False
             ):
                 minibatch = dataset.sample_transition_batch(self._batch_size)
-                obs, acts, rews, next_obs, dones = self._unpack_batch(minibatch)
+                obs, acts, rews, next_obs, dones, flag = self._unpack_batch(minibatch)
 
                 # Update the networks
-                loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones))
-                loss_dict['value_loss'].append(self._update_value(obs, acts))
-                loss_dict['policy_loss'].append(self._update_actor(obs, acts))
+                loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, flag))
+                loss_dict['value_loss'].append(self._update_value(obs, acts, flag))
+                loss_dict['policy_loss'].append(self._update_actor(obs, acts, flag))
 
                 # Soft update of target value network
                 for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
@@ -390,23 +415,27 @@ class CustomIQL(nn.Module):
                 evaluators=evaluators
             )
 
-    def forward(self, obs, acts):
-        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
-        v = self.value_net(obs)
-        logits = self.policy_net(obs)
+    def forward(self, obs, acts, flag=None):
+        if flag is None:
+            flag = self._extract_flag(obs)
+        q1, q2 = self.critic_net1(obs, acts, flag), self.critic_net2(obs, acts, flag)
+        v = self.value_net(obs, flag)
+        logits = self.policy_net(obs, flag)
         return (q1, q2), v, logits
 
-    def predict(self, obs, deterministic: bool = False):
-        logits = self.policy_net(obs)
+    def predict(self, obs, flag=None, deterministic: bool = False):
+        if flag is None:
+            flag = self._extract_flag(obs)
+        logits = self.policy_net(obs, flag)
         if deterministic:
             return logits.argmax(dim=-1).cpu().numpy()
         return Categorical(logits=logits).sample().cpu().numpy()
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones):
-        q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+    def _update_critic(self, obs, acts, rews, next_obs, dones, flag=None):
+        q1, q2 = self.critic_net1(obs, acts, flag), self.critic_net2(obs, acts, flag)
         with torch.no_grad():
-            v_next = self.target_value_net(next_obs)
-            flag = obs[:, -1, -1, -1].unsqueeze(-1)
+            next_flag = self._extract_flag(next_obs)
+            v_next = self.target_value_net(next_obs, next_flag)
             flag = torch.where(flag == 1, 3, 1)
             q_target = rews + self._gamma ** flag * (1 - dones) * v_next
 
@@ -416,10 +445,10 @@ class CustomIQL(nn.Module):
         self.critic_optim.step()
         return loss.item()
 
-    def _update_value(self, obs, acts):
-        v = self.value_net(obs)
+    def _update_value(self, obs, acts, flag=None):
+        v = self.value_net(obs, flag)
         with torch.no_grad():
-            q1, q2 = self.critic_net1(obs, acts), self.critic_net2(obs, acts)
+            q1, q2 = self.critic_net1(obs, acts, flag), self.critic_net2(obs, acts, flag)
             q = torch.min(q1, q2)
 
         diff = q - v
@@ -432,8 +461,8 @@ class CustomIQL(nn.Module):
         self.value_optim.step()
         return value_loss.item()
 
-    def _update_actor(self, obs, acts):
-        logits = self.policy_net(obs)
+    def _update_actor(self, obs, acts, flag=None):
+        logits = self.policy_net(obs, flag)
         weights = self._batch_diff
         weights = (weights - weights.mean()) / (weights.std() + 1e-6)
         policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
@@ -450,8 +479,14 @@ class CustomIQL(nn.Module):
 
         # Convert to torch tensors
         obs, acts, rews, next_obs, dones = self._to_tensors(obs, acts, rews, next_obs, dones)
+        flag = self._extract_flag(obs)
 
-        return obs, acts, rews, next_obs, dones
+        return obs, acts, rews, next_obs, dones, flag
+
+    def _extract_flag(self, obs):
+        if self._is_dummy:
+            return None
+        return obs[:, -1, -1, -1].unsqueeze(-1).long()
 
     def _to_tensors(self, *arrays):
         new_tensors = []
