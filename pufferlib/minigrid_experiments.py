@@ -14,24 +14,30 @@ from d3rlpy.preprocessing import StandardObservationScaler
 
 from importable_wrappers import *
 
-train_ppo = False
+train_ppo = True
 generate_dataset = False
-train_iql = True
+train_iql = False
 render_performance = False
 
 GAMMA = 0.99
 
 
 register(
-    id="LavaGapS5AltStep-v0",
+    # id="LavaGapS5AltStep-v0",
+    id="EmptyS5NoAltStep-v0",
     entry_point="importable_wrappers:make_lavastep_env",
     # This metadata is what Minari will use to reconstruct later
     additional_wrappers=(
         WrapperSpec(
-            name="AlternateStepWrapper",
-            entry_point="importable_wrappers:AlternateStepWrapper",
-            kwargs={},
+            name="FullyObsWrapper",
+            entry_point="minigrid.wrappers:FullyObsWrapper",
+            kwargs=None,
         ),
+        # WrapperSpec(
+            # name="AlternateStepWrapper",
+            # entry_point="importable_wrappers:AlternateStepWrapper",
+            # kwargs={},
+        # ),
         WrapperSpec(
             name="RecordableImgObsWrapper",
             entry_point="importable_wrappers:RecordableImgObsWrapper",
@@ -42,6 +48,11 @@ register(
             entry_point="importable_wrappers:RepeatFlagChannel",
             kwargs={},
         ),
+        WrapperSpec(
+            name="FloatRewardChannel",
+            entry_point="importable_wrappers:FloatRewardChannel",
+            kwargs={},
+        )
     ),
 )
 
@@ -52,8 +63,10 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=128),
     )
 
-    env_name = "LavaGapS5AltStep-v0"
-    dataset_id = "minigrid_dataset/LavaGapS5AltStepMedium-v0"
+    # env_name = "LavaGapS5AltStep-v0"
+    env_name = "EmptyS5NoAltStep-v0"
+    # dataset_id = "minigrid_dataset/LavaGapS5AltStepMedium-v0"
+    dataset_id = "minigrid_dataset/EmptyS5NoAltStepExpert-v0"
     if train_ppo:
         # Create eval callback
         # callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=1.0, verbose=1)

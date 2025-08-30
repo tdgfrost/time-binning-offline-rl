@@ -4,7 +4,7 @@ from gymnasium import spaces, ObservationWrapper
 import gymnasium as gym
 from gymnasium.spaces import Box
 from gymnasium.utils import RecordConstructorArgs
-from minigrid.wrappers import ImgObsWrapper, Wrapper
+from minigrid.wrappers import ImgObsWrapper, Wrapper, FullyObsWrapper
 from stable_baselines3 import PPO
 import torch.nn as nn
 import torch
@@ -42,9 +42,24 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         )
 
     def observation(self, obs):
-        val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
+        # val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
+        val = 0
         flag = np.full((obs.shape[0], obs.shape[1], 1), val, dtype=np.uint8)
         return np.concatenate([flag, obs], axis=-1)
+
+
+class FloatRewardChannel(RecordConstructorArgs, Wrapper):
+    """
+    Original obs shape (5, 5, 3). Append a 1-channel flag to make (5, 5, 4).
+    0 -> next action repeats once; 1 -> next action repeats twice.
+    """
+    def __init__(self, env):
+        RecordConstructorArgs.__init__(self)
+        Wrapper.__init__(self, env)
+
+    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        obs, rew, term, trunc, info = self.env.step(action)
+        return obs, float(rew), term, trunc, info
 
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
@@ -731,10 +746,14 @@ class CustomEnvironmentEvaluator:
 
 
 def make_lavastep_env(*, max_steps=100, **kwargs):
-    env = gym.make("MiniGrid-LavaGapS5-v0", max_episode_steps=None, **kwargs)
-    env = AlternateStepWrapper(env, max_steps=max_steps)
+    # env_name = "MiniGrid-LavaGapS5-v0"
+    env_name = "MiniGrid-Empty-5x5-v0"
+    env = gym.make(env_name, max_episode_steps=None, **kwargs)
+    env = FullyObsWrapper(env)
+    # env = AlternateStepWrapper(env, max_steps=max_steps)
     env = RecordableImgObsWrapper(env)         # (H,W,C) uint8 image
     env = RepeatFlagChannel(env)     # +1 channel flag
+    env = FloatRewardChannel(env)
     return env
 
 def sample_trajectory_batch(
