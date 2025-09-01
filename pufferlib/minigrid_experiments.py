@@ -15,10 +15,12 @@ import pickle
 
 from importable_wrappers import *
 
-train_ppo = True
-generate_dataset = False
+train_ppo = False
+generate_dataset = True
 train_iql = False
 render_performance = False
+
+ARTIFICIAL_DECOY_DATASET = False
 
 GAMMA = 0.99
 
@@ -29,16 +31,16 @@ register(
     entry_point="importable_wrappers:make_lavastep_env",
     # This metadata is what Minari will use to reconstruct later
     additional_wrappers=(
-        WrapperSpec(
-            name="FullyObsWrapper",
-            entry_point="minigrid.wrappers:FullyObsWrapper",
-            kwargs=None,
-        ),
         # WrapperSpec(
-            # name="AlternateStepWrapper",
-            # entry_point="importable_wrappers:AlternateStepWrapper",
-            # kwargs={},
+            # name="FullyObsWrapper",
+            # entry_point="minigrid.wrappers:FullyObsWrapper",
+            # kwargs=None,
         # ),
+        WrapperSpec(
+            name="AlternateStepWrapper",
+            entry_point="importable_wrappers:AlternateStepWrapper",
+            kwargs={},
+        ),
         WrapperSpec(
             name="RecordableImgObsWrapper",
             entry_point="importable_wrappers:RecordableImgObsWrapper",
@@ -53,7 +55,12 @@ register(
             name="FloatRewardChannel",
             entry_point="importable_wrappers:FloatRewardChannel",
             kwargs={},
-        )
+        ),
+        WrapperSpec(
+            name="DecoyObsWrapper",
+            entry_point="importable_wrappers:DecoyObsWrapper",
+            kwargs={},
+        ),
     ),
 )
 
@@ -84,109 +91,104 @@ if __name__ == "__main__":
                     policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1)
         model.learn(5e5, callback=eval_callback)  # Train for 500,000 step with early stopping
 
-    if False: # generate_dataset:
-        base_env = gym.make(env_name, max_steps=50)
-        recorded_env = DataCollector(base_env, record_infos=True, data_format="arrow")
-
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_002_steps=20000_mean=0.90.zip',
-                                 env=recorded_env, device="auto")
-
-        # Collect episodes
-        target_frames = 100_000
-        seed = 123
-        ep_count = 0
-        frame_count = 0
-        stop_loop = False
-        print("\n===== Generating dataset =====\n")
-        with tqdm(total=target_frames, desc="Progress", mininterval=2.0) as pbar:
-            while not stop_loop:
-                ep_count += 1
-                obs, info = recorded_env.reset(seed=seed + ep_count)
-                done = False
-                while not done:
-                    frame_count += 1
-                    model.set_random_seed(seed + frame_count)
-                    action, _ = model.predict(obs)
-                    obs, reward, terminated, truncated, info = recorded_env.step(action)
-                    done = terminated or truncated  # should never be truncated
-                    pbar.update(1)
-                    if frame_count >= target_frames:
-                        print(f"Reached {frame_count} frames, stopping data collection.")
-                        stop_loop = True
-                        break
-
-        # Save dataset
-        dataset = recorded_env.create_dataset(
-            dataset_id=dataset_id,
-            algorithm_name="PPO-0.50",
-            eval_env=base_env,
-            expert_policy=model,
-        )
-
-        print("Total episodes collected: ", dataset.total_episodes)
-        print("Total steps collected: ", dataset.total_steps)
-
     if generate_dataset:  # Temp
         base_env = gym.make(env_name, max_steps=50)
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_011_steps=18000_mean=0.74.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_009_steps=17000_mean=0.54.zip',
                                  env=base_env, device="auto")
-        env_evaluator = CustomEnvironmentEvaluator(gym.make(env_name, max_steps=50), n_trials=50)
 
-        replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000)
+        alt_step_env_evaluator = CustomEnvironmentEvaluator(gym.make(env_name,
+                                                                     max_steps=50),
+                                                            n_trials=500,
+                                                            has_decoy=ARTIFICIAL_DECOY_DATASET)
+        two_step_env_evaluator = CustomEnvironmentEvaluator(gym.make(env_name,
+                                                                     max_steps=50,
+                                                                     has_decoy=True,
+                                                                     decoy_interval=2),
+                                                            n_trials=500)
+        one_step_env_evaluator = CustomEnvironmentEvaluator(gym.make(env_name,
+                                                                     max_steps=50,
+                                                                     has_decoy=True,
+                                                                     decoy_interval=1),
+                                                            n_trials=500)
 
-        # Alternately collect and training
-        algo = CustomIQL(observation_shape=base_env.observation_space.shape,
-                         action_size=base_env.action_space.n,
-                         feature_size=128,
-                         batch_size=128,
-                         expectile=0.7,
-                         gamma=GAMMA,
-                         device='cuda' if torch.cuda.is_available() else 'cpu')
-        algo.compile()
+        replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000, has_decoy=ARTIFICIAL_DECOY_DATASET)
 
         # Start training
         if not os.path.exists('./dataset.pkl'):
-            replay_buffer_env.fill_buffer(model=model, n_frames=10_000, seed=123)
+            replay_buffer_env.fill_buffer(model=model, n_frames=50_000, seed=123)
             with open('./dataset.pkl', 'wb') as f:
                 pickle.dump(replay_buffer_env, f)
                 f.close()
         else:
+            print('='*50, '\nRe-using existing dataset.pkl...\n', '='*50)
             with open('./dataset.pkl', 'rb') as f:
                 replay_buffer_env = pickle.load(f)
                 f.close()
-        epoch = 0
-        eval_interval = 1_000
-        training_steps = 10_000
-        n_steps = 0
-        policy_losses = deque(maxlen=100)
-        critic_losses = deque(maxlen=100)
-        value_losses = deque(maxlen=100)
-        with tqdm(total=training_steps, desc="Progress", mininterval=2.0) as pbar:
-            while n_steps < training_steps:
-                # Sample buffer
-                obs, acts, rews, next_obs, dones = replay_buffer_env.sample_transition_batch(batch_size=32)
 
-                # Update algo
-                flags = algo._extract_flag(obs)
-                obs, acts, rews, next_obs, dones, flags = algo._to_tensors(obs, acts, rews, next_obs, dones, flags)
-                critic_losses.append(algo._update_critic(obs, acts, rews, next_obs, dones, flag=flags))
-                value_losses.append(algo._update_value(obs, acts, flag=flags))
-                policy_losses.append(algo._update_actor(obs, acts, flag=flags))
+        dataset_rewards = np.array(replay_buffer_env.rewards)[np.array(replay_buffer_env.dones) == 1]
+        dataset_n_episodes = len(dataset_rewards)
 
-                pbar.update(1)
-                pbar.set_postfix(policy_loss=f"{np.mean(policy_losses):.5f}",
-                                 critic_loss=f"{np.mean(critic_losses):.5f}",
-                                 value_loss=f"{np.mean(value_losses):.5f}")
-                n_steps += 1
+        print(f"Baseline reward of the dataset: {dataset_rewards.mean():.2f} "
+              f"+/- {dataset_rewards.std() / np.sqrt(dataset_n_episodes):.2f}")
 
-                # Evaluate
-                if n_steps % eval_interval == 0:
-                    epoch += 1
-                    mean_reward, std_reward = env_evaluator(algo)
-                    print('\n', '=' * 40)
-                    print(f"Epoch {epoch}: \n     mean_reward = {mean_reward:.2f} +/- {std_reward:.2f}")
-                    print(f"     policy_loss = {np.mean(policy_losses):.7f}\n")
-                    print('=' * 40, '\n')
+        for n_trial in range(10):
+            # Alternately collect and training
+            algo = CustomIQL(observation_shape=base_env.observation_space.shape,
+                             action_size=base_env.action_space.n,
+                             feature_size=32,
+                             batch_size=32,
+                             expectile=0.5,
+                             gamma=GAMMA,
+                             device='cuda' if torch.cuda.is_available() else 'cpu')
+            algo.compile()
+
+            epoch = 0
+            eval_interval = 10_000
+            training_steps = 10_000
+            n_steps = 0
+            policy_losses = deque(maxlen=100)
+            critic_losses = deque(maxlen=100)
+            value_losses = deque(maxlen=100)
+            with tqdm(total=training_steps, desc="Progress", mininterval=2.0) as pbar:
+                while n_steps < training_steps:
+                    # Sample buffer
+                    obs, acts, rews, next_obs, dones = replay_buffer_env.sample_transition_batch(batch_size=32)
+
+                    # Update algo
+                    flags = algo._extract_flag(obs)
+                    obs, acts, rews, next_obs, dones, flags = algo._to_tensors(obs, acts, rews, next_obs, dones, flags)
+                    critic_losses.append(algo._update_critic(obs, acts, rews, next_obs, dones, flag=flags))
+                    value_losses.append(algo._update_value(obs, acts, flag=flags))
+                    policy_losses.append(algo._update_actor(obs, acts, flag=flags))
+
+                    pbar.update(1)
+                    pbar.set_postfix(policy_loss=f"{np.mean(policy_losses):.5f}",
+                                     critic_loss=f"{np.mean(critic_losses):.5f}",
+                                     value_loss=f"{np.mean(value_losses):.5f}",
+                                     refresh=False)
+                    n_steps += 1
+
+                    # Evaluate
+                    if n_steps % eval_interval == 0:
+                        epoch += 1
+                        mean_alt_step_reward, std_alt_step_reward = alt_step_env_evaluator(algo)
+                        if ARTIFICIAL_DECOY_DATASET:
+                            mean_two_step_reward, std_two_step_reward = two_step_env_evaluator(algo)
+                        mean_one_step_reward, std_one_step_reward = one_step_env_evaluator(algo)
+                        print('\n', '=' * 40)
+                        print(f"Epoch {n_trial}: \n     "
+                              f"alt_step_mean_reward = {mean_alt_step_reward:.2f} +/- {std_alt_step_reward:.2f}")
+                        if ARTIFICIAL_DECOY_DATASET:
+                            print(f"     "
+                                  f"two_step_mean_reward = {mean_two_step_reward:.2f} +/- {std_two_step_reward:.2f}")
+                        print(f"     "
+                              f"one_step_mean_reward = {mean_one_step_reward:.2f} +/- {std_one_step_reward:.2f}\n")
+                        print(f"     policy_loss = {np.mean(policy_losses):.7f}")
+                        print(f"     critic_loss = {np.mean(critic_losses):.7f}")
+                        print(f"     value_loss  = {np.mean(value_losses):.7f}")
+                        print('=' * 40, '\n')
+
+
 
     if train_iql:
         # Load the dataset via d3rlpy's minari integration

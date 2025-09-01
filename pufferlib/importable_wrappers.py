@@ -28,25 +28,31 @@ from collections import deque
 
 
 class ReplayBufferEnv:
-    def __init__(self, env, buffer_size: int = 100000):
+    def __init__(self, env, buffer_size: int = 100000, has_decoy: bool = False):
         self.observations = deque(maxlen=buffer_size)
+        self.decoy_observations = deque(maxlen=buffer_size)
         self.actions = deque(maxlen=buffer_size)
         self.rewards = deque(maxlen=buffer_size)
         self.dones = deque(maxlen=buffer_size)
         self.buffer_size = buffer_size
         self.env = env
+        self.has_decoy = has_decoy
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
         self.observations.append(obs)
+        self.decoy_observations.append(info['obs'])
         return obs, info
 
     def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None):
         with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
             frame_count = 0
+            if seed is None:
+                seed = 123
 
             if not self.observations:
-                self.reset(seed=123)
+                self.reset(seed=seed)
+                model.set_random_seed(seed)
 
             while frame_count < n_frames:
                 done = False
@@ -55,23 +61,35 @@ class ReplayBufferEnv:
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
                     if done:
-                        obs, info = self.env.reset(seed=seed)
+                        obs, info = self.env.reset(seed=seed + frame_count)
 
-                    self.update_buffer(obs, action, reward, done)
+                    self.update_buffer(obs, action, reward, done, info)
 
                     pbar.update(1)
                     frame_count += 1
+                    model.set_random_seed(seed + frame_count)
 
-    def update_buffer(self, obs, action: None, reward: None, done: None):
+        self.observations = torch.from_numpy(self.observations).to(model.device)
+        self.actions = torch.from_numpy(np.array(self.actions)).to(model.device)
+        self.rewards = torch.from_numpy(np.array(self.rewards)).to(model.device)
+        self.dones = torch.from_numpy(np.array(self.dones)).to(model.device)
+        self.decoy_observations = torch.from_numpy(self.decoy_observations).to(model.device)
+
+    def update_buffer(self, obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict):
         self.observations.append(obs)
         self.actions.append(action)
         self.rewards.append(reward)
         self.dones.append(done)
+        self.decoy_observations.append(info['obs'])
 
-    def sample_transition_batch(self, batch_size: int = 32):
+    def sample_transition_batch(self, batch_size: int = 32, has_decoy: bool = False):
         idxs = np.random.randint(0, len(self.observations) - 1, size=batch_size)
-        obs_batch = np.array([self.observations[idx] for idx in idxs])
-        next_obs_batch = np.array([self.observations[idx + 1] for idx in idxs])
+        if has_decoy:
+            obs_batch = np.array([self.decoy_observations[idx] for idx in idxs])
+            next_obs_batch = np.array([self.decoy_observations[idx + 1] for idx in idxs])
+        else:
+            obs_batch = np.array([self.observations[idx] for idx in idxs])
+            next_obs_batch = np.array([self.observations[idx + 1] for idx in idxs])
         action_batch = np.array([[self.actions[idx]] for idx in idxs])
         reward_batch = np.array([[self.rewards[idx]] for idx in idxs])
         done_batch = np.array([[self.dones[idx]] for idx in idxs])
@@ -95,8 +113,7 @@ class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
         )
 
     def observation(self, obs):
-        # val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
-        val = 0
+        val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
         flag = np.full((obs.shape[0], obs.shape[1], 1), val, dtype=np.uint8)
         return np.concatenate([flag, obs], axis=-1)
 
@@ -121,13 +138,16 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     'bonus' step using the same action.
     """
 
-    def __init__(self, env: gym.Env, max_steps: int = 100) -> None:
+    def __init__(self, env: gym.Env, max_steps: int = 100, has_decoy: bool = False, decoy_interval: int = 1) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
         # super().__init__(env)
         self.step_mode = 0
         self.step_count = 0
         self.max_steps = max_steps
+        self.has_decoy = has_decoy
+        assert 0 < decoy_interval <= 2
+        self.decoy_interval = decoy_interval
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs1, reward1, term1, _, info1 = self.env.step(action)
@@ -135,14 +155,30 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         trunc = self.get_trunc()
         reward1 = self._update_step_reward(reward1)
 
+        if self.has_decoy:
+            # Force 2-step mode
+            if term1 or self.decoy_interval == 1:
+                info1['bonus_step_taken'] = False
+                info1['obs'] = obs1
+                return obs1, float(reward1), (term1 or trunc), False, info1
+
+            info1['bonus_step_taken'] = True
+            self.unwrapped.step_count -= 1
+            obs2, reward2, term2, _, info2 = self.env.step(action)
+            info1.update(info2)
+            reward2 = self._update_step_reward(reward2)
+            info1['obs'] = obs2
+            return obs2, float(reward2), (term2 or trunc), False, info1
+
         if term1:
             self.step_mode = 0
 
         if self.step_mode == 0:
             info1['bonus_step_taken'] = False
             self.step_mode = 1
+            info1['obs'] = obs1
             return obs1, float(reward1), (term1 or trunc), False, info1
-        else:
+        elif self.step_mode == 1:
             info1['bonus_step_taken'] = True
             self.step_mode = 0
 
@@ -151,6 +187,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             obs2, reward2, term2, _, info2 = self.env.step(action)
             info1.update(info2)
             reward2 = self._update_step_reward(reward2)
+            info1['obs'] = obs2
             if term2:
                 return obs2, float(reward2), term2, False, info1
 
@@ -160,6 +197,9 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
             info1.update(info3)
             reward3 = self._update_step_reward(reward3)
             return obs3, float(reward3), (term3 or trunc), False, info1
+
+        else:
+            raise ValueError(f"Invalid step_mode: {self.step_mode}")
 
     def get_trunc(self):
         # This is used to set term, NOT trunc
@@ -179,6 +219,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
         self.step_count = 0
         obs, info = self.env.reset(*args, **kwargs)
         info['bonus_step_taken'] = False
+        info['obs'] = obs
         return obs, info
 
 
@@ -200,6 +241,34 @@ class RecordableImgObsWrapper(RecordConstructorArgs, ImgObsWrapper):
         target_dtype = obs['image'].dtype
         return np.concatenate((np.full(target_shape[:-1] + (1,), fill_value=obs['direction'], dtype=target_dtype),
                                obs["image"]), -1)
+
+
+class DecoyObsWrapper(RecordConstructorArgs, Wrapper):
+    def __init__(self, env):
+        RecordConstructorArgs.__init__(self)
+        Wrapper.__init__(self, env)
+
+    def reset(self, *args, **kwargs):
+        obs, info = self.env.reset(*args, **kwargs)
+        info = self._fill_obs(info)
+        return obs, info
+
+    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        obs, rew, term, trunc, info = self.env.step(action)
+        info = self._fill_obs(info)
+        return obs, rew, term, trunc, info
+
+    @staticmethod
+    def _fill_obs(info):
+        obs, direction = info['obs']['image'], info['obs']['direction']
+        target_shape = obs.shape[:-1] + (1,)
+        obs = np.concatenate((np.full(target_shape, fill_value=direction, dtype=obs.dtype),
+                              obs), -1)
+
+        flag = np.full(target_shape, 0, dtype=obs.dtype)
+        obs = np.concatenate([flag, obs], axis=-1)
+        info['obs'] = obs
+        return info
 
 
 class CallablePPO(PPO):
@@ -348,6 +417,7 @@ class PPOMiniGridCNN(nn.Module):
             nn.GroupNorm(1, 64),
             nn.ReLU(),
 
+            nn.AdaptiveAvgPool2d(output_size=1),
             nn.Flatten(),
         )
         with torch.no_grad():
@@ -431,7 +501,7 @@ class OfflineMiniGridCNN(nn.Module):
             nn.Linear(n_flat, feature_size),
             nn.LayerNorm(feature_size),
             nn.ReLU(),
-            nn.Dropout(p=0.2),
+            # nn.Dropout(p=0.2),
         )
 
     @staticmethod
@@ -506,6 +576,33 @@ class CustomNet(nn.Module):
             nn.Linear(feature_size // 2, output_size)
         ).to(device)
 
+        self.init_weights()
+
+    def init_weights(self):
+        """
+        Initialize weights for Conv2d/Linear with Kaiming normal,
+        biases with zeros, Norm layers with weight=1, bias=0.
+        The final Linear layer in the decoder is zero-initialized.
+        """
+        def _init_fn(m: nn.Module):
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # apply to all submodules
+        self.apply(_init_fn)
+
+        # special-case: zero-init the very last decoder layer
+        if isinstance(self.decoder[-1], nn.Linear):
+            nn.init.zeros_(self.decoder[-1].weight)
+            nn.init.zeros_(self.decoder[-1].bias)
+
     def forward(self, x: torch.Tensor, action: torch.Tensor = None, flag: torch.Tensor = None) -> torch.Tensor:
         x, action, flag = self._ndarray_to_tensor(x, action, flag)
 
@@ -565,11 +662,11 @@ class CustomIQL(nn.Module):
         self.policy_net = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
 
         # Give both critic nets to the critic optimizer
-        self.critic_optim = torch.optim.Adam(list(self.critic_net1.encoder.parameters()) +
+        self.critic_optim = torch.optim.AdamW(list(self.critic_net1.encoder.parameters()) +
                                              list(self.critic_net1.decoder.parameters()) +
                                              list(self.critic_net2.decoder.parameters()), lr=critic_lr)
-        self.value_optim = torch.optim.Adam(self.value_net.parameters(), lr=value_lr)
-        self.policy_optim = torch.optim.Adam(self.policy_net.parameters(), lr=actor_lr)
+        self.value_optim = torch.optim.AdamW(self.value_net.parameters(), lr=value_lr)
+        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=actor_lr)
 
         # clone the value net to a target network
         for target_param, param in zip(self.target_value_net.decoder.parameters(), self.value_net.decoder.parameters()):
@@ -667,6 +764,8 @@ class CustomIQL(nn.Module):
         # weights = (weights - weights.mean()) / (weights.std() + 1e-6)
         policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
         policy_loss = (policy_loss * torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)).mean()
+
+        # policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='mean')
 
         self.policy_optim.zero_grad()
         policy_loss.backward()
@@ -899,14 +998,15 @@ class CustomTrajectoryMiniBatch(TrajectoryMiniBatch):
 
 
 class CustomEnvironmentEvaluator:
-    def __init__(self, env: RepeatFlagChannel, n_trials: int):
+    def __init__(self, env: RepeatFlagChannel, n_trials: int, has_decoy: bool = False):
         self.env = env
         self.n_trials = n_trials
+        self.has_decoy = has_decoy
 
     def __call__(self, algo) -> float:
         mean_returns = []
         for _ in range(self.n_trials):
-            obs = self.env.reset()[0]
+            obs = self._decoy_obs_maybe(*self.env.reset())
             done = False
             total_reward = 0.0
 
@@ -914,6 +1014,7 @@ class CustomEnvironmentEvaluator:
                 with torch.no_grad():
                     action = algo.predict(np.expand_dims(obs, 0))
                 obs, reward, terminated, truncated, info = self.env.step(action)
+                obs = self._decoy_obs_maybe(obs, info)
                 done = terminated or truncated
                 total_reward += reward
 
@@ -921,16 +1022,23 @@ class CustomEnvironmentEvaluator:
 
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
 
+    def _decoy_obs_maybe(self, obs, info):
+        if self.has_decoy:
+            return info['obs']
+        else:
+            return obs
 
-def make_lavastep_env(*, max_steps=100, **kwargs):
+
+def make_lavastep_env(*, max_steps=100, has_decoy: bool = False, decoy_interval: int = 1, **kwargs):
     env_name = "MiniGrid-LavaGapS5-v0"
     # env_name = "MiniGrid-Empty-5x5-v0"
     env = gym.make(env_name, max_episode_steps=None, **kwargs)
-    env = FullyObsWrapper(env)
-    # env = AlternateStepWrapper(env, max_steps=max_steps)
+    # env = FullyObsWrapper(env)
+    env = AlternateStepWrapper(env, max_steps=max_steps, has_decoy=has_decoy, decoy_interval=decoy_interval)
     env = RecordableImgObsWrapper(env)         # (H,W,C) uint8 image
     env = RepeatFlagChannel(env)     # +1 channel flag
     env = FloatRewardChannel(env)
+    env = DecoyObsWrapper(env)
     return env
 
 def sample_trajectory_batch(
