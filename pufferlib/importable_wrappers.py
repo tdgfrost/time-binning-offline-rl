@@ -26,6 +26,59 @@ from d3rlpy.dataset.mini_batch import TrajectoryMiniBatch
 from tqdm import tqdm
 from collections import deque
 
+
+class ReplayBufferEnv:
+    def __init__(self, env, buffer_size: int = 100000):
+        self.observations = deque(maxlen=buffer_size)
+        self.actions = deque(maxlen=buffer_size)
+        self.rewards = deque(maxlen=buffer_size)
+        self.dones = deque(maxlen=buffer_size)
+        self.buffer_size = buffer_size
+        self.env = env
+
+    def reset(self, seed: int = None):
+        obs, info = self.env.reset(seed=seed)
+        self.observations.append(obs)
+        return obs, info
+
+    def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None):
+        with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
+            frame_count = 0
+
+            if not self.observations:
+                self.reset(seed=123)
+
+            while frame_count < n_frames:
+                done = False
+                while not done:
+                    action, _ = model.predict(self.observations[-1])
+                    obs, reward, term, trunc, info = self.env.step(action)
+                    done = term or trunc
+                    if done:
+                        obs, info = self.env.reset(seed=seed)
+
+                    self.update_buffer(obs, action, reward, done)
+
+                    pbar.update(1)
+                    frame_count += 1
+
+    def update_buffer(self, obs, action: None, reward: None, done: None):
+        self.observations.append(obs)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+
+    def sample_transition_batch(self, batch_size: int = 32):
+        idxs = np.random.randint(0, len(self.observations) - 1, size=batch_size)
+        obs_batch = np.array([self.observations[idx] for idx in idxs])
+        next_obs_batch = np.array([self.observations[idx + 1] for idx in idxs])
+        action_batch = np.array([[self.actions[idx]] for idx in idxs])
+        reward_batch = np.array([[self.rewards[idx]] for idx in idxs])
+        done_batch = np.array([[self.dones[idx]] for idx in idxs])
+
+        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch
+
+
 class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
     """
     Original obs shape (5, 5, 3). Append a 1-channel flag to make (5, 5, 4).
@@ -118,7 +171,7 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     def _update_step_reward(reward: float) -> float:
         # Simplify the reward to per-step basis
         if reward > 0:
-            return 1.0
+            return reward # 1.0
         return 0.0
 
     def reset(self, *args, **kwargs) -> np.ndarray:
@@ -159,6 +212,113 @@ class CallablePPO(PPO):
     def __call__(self, obs):
         action, _ = self.predict(obs, deterministic=True)
         return action
+
+
+class ResidualConvBlock(nn.Module):
+    """
+    Pre-activation residual block.
+    If stride>1 or in/out channels differ, uses a 1x1 projection on the skip.
+    """
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(1, in_ch)
+        self.act1  = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+
+        self.norm2 = nn.GroupNorm(1, out_ch)
+        self.act2  = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+
+        self.proj = None
+        if stride != 1 or in_ch != out_ch:
+            self.proj = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False)
+
+    def forward(self, x):
+        identity = x
+        out = self.act1(self.norm1(x))
+        out = self.conv1(out)
+        out = self.act2(self.norm2(out))
+        out = self.conv2(out)
+        if self.proj is not None:
+            identity = self.proj(identity)
+        return out + identity
+
+
+class ResidualMLPBlock(nn.Module):
+    """
+    Two-layer residual MLP block with LayerNorm and ReLU pre-activation.
+    """
+    def __init__(self, dim: int, hidden: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.fc1   = nn.Linear(dim, hidden)
+        self.act1  = nn.ReLU(inplace=True)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.fc2   = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        h = self.fc1(self.norm1(x))
+        h = self.act1(h)
+        h = self.fc2(self.norm2(h))
+        return x + h
+
+
+class SpatialAttention(nn.Module):
+    """CBAM-style spatial attention. Produces an HxW mask and reweights all channels."""
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        nn.init.zeros_(self.conv.weight)  # start near identity
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx, _ = torch.max(x, dim=1, keepdim=True)
+        a = torch.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))  # [B,1,H,W]
+        return x * a
+
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation (channel attention)."""
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.fc1 = nn.Linear(channels, hidden, bias=True)
+        self.fc2 = nn.Linear(hidden, channels, bias=True)
+        # Init so the block starts as a no-op
+        nn.init.kaiming_uniform_(self.fc1.weight, a=1.0)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.ones_(self.fc2.bias)
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        s = torch.mean(x, dim=(2, 3))            # GAP -> [B, C]
+        s = torch.relu(self.fc1(s))
+        s = torch.sigmoid(self.fc2(s))           # [B, C]
+        s = s.view(s.size(0), s.size(1), 1, 1)
+        return x * s
+
+# (Optional) Pixel self-attention; cheap at 7x7. Uncomment to use.
+class NonLocalBlock(nn.Module):
+    def __init__(self, in_ch: int, inter_ch: int | None = None):
+        super().__init__()
+        inter_ch = inter_ch or max(1, in_ch // 2)
+        self.theta = nn.Conv2d(in_ch, inter_ch, 1, bias=False)
+        self.phi   = nn.Conv2d(in_ch, inter_ch, 1, bias=False)
+        self.g     = nn.Conv2d(in_ch, inter_ch, 1, bias=False)
+        self.out   = nn.Conv2d(inter_ch, in_ch, 1, bias=False)
+        # Zero-init output conv for stability (residual starts as identity)
+        nn.init.zeros_(self.out.weight)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        theta = self.theta(x).view(B, -1, H*W).transpose(1, 2)   # [B, HW, I]
+        phi   = self.phi(x).view(B, -1, H*W)                     # [B, I, HW]
+        attn  = torch.softmax(theta @ phi, dim=-1)               # [B, HW, HW]
+        g     = self.g(x).view(B, -1, H*W).transpose(1, 2)       # [B, HW, I]
+        y     = (attn @ g).transpose(1, 2).view(B, -1, H, W)     # [B, I, H, W]
+        return x + self.out(y)
 
 
 class PPOMiniGridCNN(nn.Module):
@@ -216,7 +376,7 @@ class OfflineMiniGridCNN(nn.Module):
             C, H, W = observation_shape
             self.permute_obs_maybe = lambda x: x
 
-        C -= 2  # we will ignore the flag (processed separately) AND the last channel (always 0 in LavaGap)
+        C -= 2  # ignore flag and last (always-zero) channel
         self.shrink_obs = lambda x: x[:, 1:C+1, :, :]
 
         if input_scaling:
@@ -224,54 +384,69 @@ class OfflineMiniGridCNN(nn.Module):
         else:
             self.scale_inputs_maybe = lambda x: x
 
+        # --- CNN trunk with channel + spatial attention ---
+        """
+        self.cnn = nn.Sequential(
+            nn.Conv2d(C, 32, kernel_size=3, padding=1),   # 7x7 -> 7x7
+            nn.GroupNorm(1, 32),
+            nn.ReLU(inplace=True),
+            SEBlock(32, reduction=8),                     # channel attention
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),  # 7x7 -> 7x7
+            nn.GroupNorm(1, 64),
+            nn.ReLU(inplace=True),
+
+            SpatialAttention(kernel_size=7),              # pixel (spatial) attention
+            NonLocalBlock(64),                          # optional: enable if you want full pixel self-attention
+
+            nn.MaxPool2d(kernel_size=2, stride=2),        # 7x7 -> 3x3
+            nn.Flatten()
+        )
+        """
+
         self.cnn = nn.Sequential(
             nn.Conv2d(C, 16, kernel_size=2),
             nn.GroupNorm(1, 16),
             nn.ReLU(),
+            # nn.Dropout2d(p=0.2),
 
             nn.Conv2d(16, 32, kernel_size=2),
             nn.GroupNorm(1, 32),
             nn.ReLU(),
+            # nn.Dropout2d(p=0.2),
 
             nn.Conv2d(32, 64, kernel_size=2),
             nn.GroupNorm(1, 64),
             nn.ReLU(),
+            # nn.Dropout2d(p=0.2),
 
+            nn.AdaptiveAvgPool2d(output_size=1),
             nn.Flatten(),
         )
+
         with torch.no_grad():
-            n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]
+            n_flat = self.cnn(torch.zeros(1, C, H, W)).shape[1]  # likely 64*3*3=576
 
         self.fc = nn.Sequential(
             nn.Linear(n_flat, feature_size),
             nn.LayerNorm(feature_size),
             nn.ReLU(),
+            nn.Dropout(p=0.2),
         )
 
     @staticmethod
     def scale_inputs(x):
-        """
-        To scale the channels to 0-1 range:
-        0) 0-1 (repeat flag)
-        1) 0-3 (direction)
-        2) 0 - 10 (OBJECT_IDX)
-        3) 0 - 5 (COLOR_IDX)
-        4) 0 (always)
-
-        Assumes shape (N, C, H, W)
-        """
         scaled_x = x.clone()
         scaled_x[:, 1, :, :] /= 3.0
         scaled_x[:, 2, :, :] /= 10.0
         scaled_x[:, 3, :, :] /= 5.0
         return scaled_x
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        permuted_x = self.permute_obs_maybe(x)
-        scaled_x = self.scale_inputs_maybe(permuted_x)
-        scaled_x = self.shrink_obs(scaled_x)
-        return self.fc(self.cnn(scaled_x))
+        x = self.permute_obs_maybe(x)
+        x = self.scale_inputs_maybe(x)
+        x = self.shrink_obs(x)
+        return self.fc(self.cnn(x))
 
 
 class MinigridFeaturesExtractor(BaseFeaturesExtractor):
@@ -321,10 +496,12 @@ class CustomNet(nn.Module):
             nn.Linear(feature_size, feature_size // 2),
             nn.LayerNorm(feature_size // 2),
             nn.ReLU(),
+            # nn.Dropout(0.2),
 
             nn.Linear(feature_size // 2, feature_size // 2),
             nn.LayerNorm(feature_size // 2),
             nn.ReLU(),
+            # nn.Dropout(0.2),
 
             nn.Linear(feature_size // 2, output_size)
         ).to(device)
@@ -363,7 +540,7 @@ class CustomNet(nn.Module):
 
 class CustomIQL(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], action_size: int,  input_length: int = 2,
-                 is_dummy: bool = False, feature_size: int = 128, batch_size: int = 128, expectile: float = 0.8,
+                 is_dummy: bool = False, feature_size: int = 128, batch_size: int = 128, expectile: float = 0.7,
                  gamma: float = 0.99, critic_lr: float = 3e-4, value_lr: float = 3e-4, actor_lr: float = 3e-4,
                  device: str = 'cpu'):
         super().__init__()
@@ -476,7 +653,7 @@ class CustomIQL(nn.Module):
 
         diff = q - v
         self._batch_diff = diff.detach().squeeze()
-        weights = torch.absolute(self._expectile - (diff < 0).float()).squeeze()
+        weights = torch.absolute(self._expectile - (self._batch_diff < 0).float()).squeeze()
         value_loss = (weights * (diff.squeeze() ** 2)).mean()
 
         self.value_optim.zero_grad()
@@ -487,9 +664,9 @@ class CustomIQL(nn.Module):
     def _update_actor(self, obs, acts, flag=None):
         logits = self.policy_net(obs, flag=flag)
         weights = self._batch_diff
-        weights = (weights - weights.mean()) / (weights.std() + 1e-6)
+        # weights = (weights - weights.mean()) / (weights.std() + 1e-6)
         policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
-        policy_loss = (policy_loss * torch.clip(torch.exp(1.0 * weights), -torch.inf, 100)).mean()
+        policy_loss = (policy_loss * torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)).mean()
 
         self.policy_optim.zero_grad()
         policy_loss.backward()
@@ -746,8 +923,8 @@ class CustomEnvironmentEvaluator:
 
 
 def make_lavastep_env(*, max_steps=100, **kwargs):
-    # env_name = "MiniGrid-LavaGapS5-v0"
-    env_name = "MiniGrid-Empty-5x5-v0"
+    env_name = "MiniGrid-LavaGapS5-v0"
+    # env_name = "MiniGrid-Empty-5x5-v0"
     env = gym.make(env_name, max_episode_steps=None, **kwargs)
     env = FullyObsWrapper(env)
     # env = AlternateStepWrapper(env, max_steps=max_steps)
