@@ -1,8 +1,7 @@
-from typing import Tuple, Dict, Any, Union
+from typing import Tuple, Dict, Any, Union, Sequence, Optional
 import numpy as np
 from gymnasium import spaces, ObservationWrapper
 import gymnasium as gym
-from gymnasium.spaces import Box
 from gymnasium.utils import RecordConstructorArgs
 from minigrid.wrappers import ImgObsWrapper, Wrapper, FullyObsWrapper
 from stable_baselines3 import PPO
@@ -10,39 +9,54 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from typing import Sequence
 from pathlib import Path
-from d3rlpy.models.encoders import register_encoder_factory
-import dataclasses
 from stable_baselines3.common.callbacks import BaseCallback
-import d3rlpy
 from torch.distributions import Categorical
-from d3rlpy.dataset.trajectory_slicers import TrajectorySlicerProtocol
-from d3rlpy.dataset.components import EpisodeBase, PartialTrajectory
-from d3rlpy.types import Float32NDArray, Int32NDArray, ObservationSequence, NDArray
-from d3rlpy.dataset.utils import (batch_pad_array, batch_pad_observations, slice_observations, check_dtype,
-                                  cast_recursively, stack_observations)
-from d3rlpy.dataset.mini_batch import TrajectoryMiniBatch
 from tqdm import tqdm
 from collections import deque
 
 
 class ReplayBufferEnv:
-    def __init__(self, env, buffer_size: int = 100000, has_decoy: bool = False):
-        self.observations = deque(maxlen=buffer_size)
-        self.decoy_observations = deque(maxlen=buffer_size)
-        self.actions = deque(maxlen=buffer_size)
-        self.rewards = deque(maxlen=buffer_size)
-        self.dones = deque(maxlen=buffer_size)
+    def __init__(self, env, buffer_size: int = 100000):
+        self.observations = {
+            0: deque(maxlen=buffer_size),
+            1: deque(maxlen=buffer_size),
+            2: deque(maxlen=buffer_size)
+        }
+        self.actions = {
+            0: deque(maxlen=buffer_size),
+            1: deque(maxlen=buffer_size),
+            2: deque(maxlen=buffer_size)
+        }
+        self.rewards = {
+            0: deque(maxlen=buffer_size),
+            1: deque(maxlen=buffer_size),
+            2: deque(maxlen=buffer_size)
+        }
+        self.dones = {
+            0: deque(maxlen=buffer_size),
+            1: deque(maxlen=buffer_size),
+            2: deque(maxlen=buffer_size)
+        }
+
         self.buffer_size = buffer_size
         self.env = env
-        self.has_decoy = has_decoy
+        self._tensors_set = False
+        self._device = None
 
     def reset(self, seed: int = None):
         obs, info = self.env.reset(seed=seed)
-        self.observations.append(obs)
-        self.decoy_observations.append(info['obs'])
-        return obs, info
+        ep_buffer = self._reset_ep_buffer(obs, info)
+        return obs, info, ep_buffer
+
+    @staticmethod
+    def _reset_ep_buffer(obs, info):
+        return {
+            'obs': [obs], 'decoy_obs': [info['obs'][0]],
+            'action': [], 'decoy_action': [],
+            'reward': [], 'decoy_reward': [],
+            'done': [], 'decoy_done': [],
+        }
 
     def fill_buffer(self, model, n_frames: int = 1_000, seed: int = None):
         with tqdm(total=n_frames, desc="Progress", mininterval=2.0) as pbar:
@@ -50,86 +64,105 @@ class ReplayBufferEnv:
             if seed is None:
                 seed = 123
 
-            if not self.observations:
-                self.reset(seed=seed)
-                model.set_random_seed(seed)
+            obs, info, ep_buffer = self.reset(seed=seed)
+            model.set_random_seed(seed)
 
             while frame_count < n_frames:
                 done = False
                 while not done:
-                    action, _ = model.predict(self.observations[-1])
+                    action, _ = model.predict(obs)
                     obs, reward, term, trunc, info = self.env.step(action)
                     done = term or trunc
-                    if done:
-                        obs, info = self.env.reset(seed=seed + frame_count)
 
-                    self.update_buffer(obs, action, reward, done, info)
+                    self.update_episode_buffer(obs, action, reward, done, info, ep_buffer)
+
+                    if done:
+                        ep_buffer['obs'] = ep_buffer['obs'][:-1]
+                        ep_buffer['decoy_obs'] = ep_buffer['decoy_obs'][:-1]
+                        obs, info = self.env.reset(seed=seed + frame_count)
 
                     pbar.update(1)
                     frame_count += 1
                     model.set_random_seed(seed + frame_count)
 
-        self.observations = torch.from_numpy(self.observations).to(model.device)
-        self.actions = torch.from_numpy(np.array(self.actions)).to(model.device)
-        self.rewards = torch.from_numpy(np.array(self.rewards)).to(model.device)
-        self.dones = torch.from_numpy(np.array(self.dones)).to(model.device)
-        self.decoy_observations = torch.from_numpy(self.decoy_observations).to(model.device)
+                # Add ep_buffer to permanent buffer
+                self.update_permanent_buffer(ep_buffer)
+                # Reset ep_buffer and add 'obs' to it
+                ep_buffer = self._reset_ep_buffer(obs, info)
 
-    def update_buffer(self, obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict):
-        self.observations.append(obs)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        self.decoy_observations.append(info['obs'])
+            # Add a garbage all-zeros "final obs"
+            for i in [0, 1, 2]:
+                self.observations[i] += [np.zeros_like(self.observations[0][0])]
 
-    def sample_transition_batch(self, batch_size: int = 32, has_decoy: bool = False):
-        idxs = np.random.randint(0, len(self.observations) - 1, size=batch_size)
-        if has_decoy:
-            obs_batch = np.array([self.decoy_observations[idx] for idx in idxs])
-            next_obs_batch = np.array([self.decoy_observations[idx + 1] for idx in idxs])
+    def set_to_tensors(self, device: str = 'cpu'):
+        if self._tensors_set:
+            if self._device == device:
+                return
+            for i in [0, 1, 2]:
+                self.observations[i] = self.observations[i].to(device)
+                self.actions[i] = self.actions[i].to(device)
+                self.rewards[i] = self.rewards[i].to(device)
+                self.dones[i] = self.dones[i].to(device)
         else:
-            obs_batch = np.array([self.observations[idx] for idx in idxs])
-            next_obs_batch = np.array([self.observations[idx + 1] for idx in idxs])
-        action_batch = np.array([[self.actions[idx]] for idx in idxs])
-        reward_batch = np.array([[self.rewards[idx]] for idx in idxs])
-        done_batch = np.array([[self.dones[idx]] for idx in idxs])
+            for i in [0, 1, 2]:
+                self.observations[i] = torch.from_numpy(np.array(self.observations[i])).to(device)
+                self.actions[i] = torch.from_numpy(np.array(self.actions[i])).to(device)
+                self.rewards[i] = torch.from_numpy(np.array(self.rewards[i])).to(device)
+                self.dones[i] = torch.from_numpy(np.array(self.dones[i])).to(device)
 
-        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch
+        self._tensors_set = True
+        self._device = device
 
+    @staticmethod
+    def update_episode_buffer(obs, action: Union[int, np.ndarray], reward: float, done: bool, info: dict, ep_buffer: dict):
+        for key in ['obs', 'action', 'reward', 'done']:
+            ep_buffer[f'decoy_{key}'] += info[key]
 
-class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
-    """
-    Original obs shape (5, 5, 3). Append a 1-channel flag to make (5, 5, 4).
-    0 -> next action repeats once; 1 -> next action repeats twice.
-    """
-    def __init__(self, env):
-        RecordConstructorArgs.__init__(self)
-        ObservationWrapper.__init__(self, env)
-        # super().__init__(env)
-        assert isinstance(env.observation_space, spaces.Box)
-        h, w, c = env.observation_space.shape
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=(h, w, c + 1), dtype=np.uint8
-        )
+        ep_buffer['obs'] += [obs]
+        ep_buffer['action'] += [action]
+        ep_buffer['reward'] += [reward]
+        ep_buffer['done'] += [done]
 
-    def observation(self, obs):
-        val = 1 if self.env.get_wrapper_attr("step_mode") == 1 else 0 # 0 for no repeat, 1 for repeat
-        flag = np.full((obs.shape[0], obs.shape[1], 1), val, dtype=np.uint8)
-        return np.concatenate([flag, obs], axis=-1)
+    def update_permanent_buffer(self, ep_buffer: dict):
+        for i, decoy_maybe in [(0, ''), (1, 'decoy_')]:
+            self.observations[i] += ep_buffer[f'{decoy_maybe}obs']
+            self.actions[i] += ep_buffer[f'{decoy_maybe}action']
+            self.rewards[i] += ep_buffer[f'{decoy_maybe}reward']
+            self.dones[i] += ep_buffer[f'{decoy_maybe}done']
 
+        obs, actions, rewards, dones = [
+            [ep_buffer[f'decoy_{key}'][idx] for idx in range(0, len(ep_buffer[f'decoy_{key}']), 2)]
+            for key in ['obs', 'action', 'reward', 'done']
+        ]
+        if not dones[-1]:
+            rewards[-1] = ep_buffer['reward'][-1]
+            dones[-1] = ep_buffer['done'][-1]
+        assert dones[-1], "Last done flag should be True"
+        self.observations[2] += obs
+        self.actions[2] += actions
+        self.rewards[2] += rewards
+        self.dones[2] += dones
 
-class FloatRewardChannel(RecordConstructorArgs, Wrapper):
-    """
-    Original obs shape (5, 5, 3). Append a 1-channel flag to make (5, 5, 4).
-    0 -> next action repeats once; 1 -> next action repeats twice.
-    """
-    def __init__(self, env):
-        RecordConstructorArgs.__init__(self)
-        Wrapper.__init__(self, env)
+    def sample_transition_batch(self, batch_size: int = 32, decoy_interval: int = 0):
+        assert self._tensors_set, "Replay buffer must be set to tensors first using .set_to_tensors(model)"
+        idxs = torch.randint(0, len(self.observations[decoy_interval]) - 1, (batch_size,), device=self._device)
 
-    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs, rew, term, trunc, info = self.env.step(action)
-        return obs, float(rew), term, trunc, info
+        obs_batch = self.observations[decoy_interval][idxs]
+        next_obs_batch = self.observations[decoy_interval][idxs + 1]
+        action_batch = self.actions[decoy_interval][idxs].unsqueeze(-1)
+        reward_batch = self.rewards[decoy_interval][idxs].unsqueeze(-1)
+        done_batch = self.dones[decoy_interval][idxs].unsqueeze(-1)
+
+        flags = self._extract_flags(obs_batch)
+        next_flags = self._extract_flags(next_obs_batch)
+
+        return obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, flags, next_flags
+
+    @staticmethod
+    def _extract_flags(obs):
+        if obs.shape[-1] in (1, 5):
+            return obs[:, -1, -1, 0].unsqueeze(-1).long()
+        return obs[:, 0, -1, -1].unsqueeze(-1).long()
 
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
@@ -138,70 +171,107 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     'bonus' step using the same action.
     """
 
-    def __init__(self, env: gym.Env, max_steps: int = 100, has_decoy: bool = False, decoy_interval: int = 1) -> None:
+    def __init__(self, env: gym.Env, max_steps: int = 100, forced_interval: int = 0) -> None:
         RecordConstructorArgs.__init__(self)
         Wrapper.__init__(self, env)
         # super().__init__(env)
-        self.step_mode = 0
+        self.last_step_mode = 0
+        self.current_step_mode = 0
         self.step_count = 0
         self.max_steps = max_steps
-        self.has_decoy = has_decoy
-        assert 0 < decoy_interval <= 2
-        self.decoy_interval = decoy_interval
+        assert 0 <= forced_interval <= 1, "Forced interval must be 0 or 1"
+        self.forced_interval = forced_interval
+
+    def reset(self, *args, **kwargs) -> np.ndarray:
+        self.last_step_mode = 0
+        self.current_step_mode = 0
+        self.step_count = 0
+        obs, info = self.env.reset(*args, **kwargs)
+        info['obs'] = [obs]
+        info['action'] = []
+        info['reward'] = []
+        info['done'] = []
+        info = self._take_no_additional_steps(info)
+        return obs, info
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs1, reward1, term1, _, info1 = self.env.step(action)
-        self.step_count += 1
-        trunc = self.get_trunc()
-        reward1 = self._update_step_reward(reward1)
+        # Do our first genuine environment step
+        obs, reward, term, trunc, info = self._take_first_step(action)
 
-        if self.has_decoy:
-            # Force 2-step mode
-            if term1 or self.decoy_interval == 1:
-                info1['bonus_step_taken'] = False
-                info1['obs'] = obs1
-                return obs1, float(reward1), (term1 or trunc), False, info1
+        # Decide if we are forcing 1-step intervals
+        if self.forced_interval:
+            info = self._take_no_additional_steps(info)
+            info['done'][-1] = term or trunc
+            return obs, reward, (term or trunc), False, info
 
-            info1['bonus_step_taken'] = True
-            self.unwrapped.step_count -= 1
-            obs2, reward2, term2, _, info2 = self.env.step(action)
-            info1.update(info2)
-            reward2 = self._update_step_reward(reward2)
-            info1['obs'] = obs2
-            return obs2, float(reward2), (term2 or trunc), False, info1
+        # Take 1-step only (or if environment has already terminated)
+        if term or self.current_step_mode == 0:
+            # Update step_mode for next observation
+            self._flip_step_modes()
 
-        if term1:
-            self.step_mode = 0
+            info = self._take_no_additional_steps(info)
+            info['done'][-1] = term or trunc
+            return obs, reward, (term or trunc), False, info
 
-        if self.step_mode == 0:
-            info1['bonus_step_taken'] = False
-            self.step_mode = 1
-            info1['obs'] = obs1
-            return obs1, float(reward1), (term1 or trunc), False, info1
-        elif self.step_mode == 1:
-            info1['bonus_step_taken'] = True
-            self.step_mode = 0
+        # Take 3-steps
+        elif self.current_step_mode == 1:
+            # Update step_mode for next observation
+            self._flip_step_modes()
 
-            # Second step:
-            self.unwrapped.step_count -= 1
-            obs2, reward2, term2, _, info2 = self.env.step(action)
-            info1.update(info2)
-            reward2 = self._update_step_reward(reward2)
-            info1['obs'] = obs2
-            if term2:
-                return obs2, float(reward2), term2, False, info1
+            # Take another step (second)
+            obs, reward, term, _, info = self._take_another_step(action, info)
+            if term:
+                info['done'][-1] = term or trunc
+                return obs, reward, (term or trunc), False, info
 
-            # Third step:
-            self.unwrapped.step_count -= 1
-            obs3, reward3, term3, _, info3 = self.env.step(action)
-            info1.update(info3)
-            reward3 = self._update_step_reward(reward3)
-            return obs3, float(reward3), (term3 or trunc), False, info1
+            # Take another step (third)
+            obs, reward, term, _, info = self._take_another_step(action, info)
+            info['done'][-1] = term or trunc
+            return obs, reward, (term or trunc), False, info
 
         else:
             raise ValueError(f"Invalid step_mode: {self.step_mode}")
 
-    def get_trunc(self):
+    def _flip_step_modes(self):
+        self.last_step_mode = self.current_step_mode
+        self.current_step_mode = 1 - self.current_step_mode
+
+    def _take_first_step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        obs, reward, term, _, info = self.env.step(action)
+        self.step_count += 1
+        trunc = self._get_trunc()
+        reward = self._update_step_reward(reward)
+        info['obs'] = [obs]
+        info['action'] = [action]
+        info['reward'] = [reward]
+        info['done'] = [False]
+        return obs, reward, term, trunc, info
+
+    @staticmethod
+    def _take_no_additional_steps(info):
+        info['bonus_step_taken'] = False
+        return info
+
+    def _take_another_step(self, action: Any, base_info: Dict[str, Any], record_obs: bool = False) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        # Take additional step
+        base_info['bonus_step_taken'] = True
+        self.unwrapped.step_count -= 1
+        obs, reward, term, _, new_info = self.env.step(action)
+
+        # Update return variables
+        base_info, reward = self._update_info_and_reward(base_info, new_info, reward)
+        base_info['obs'].append(obs)
+        base_info['action'].append(action)
+        base_info['reward'].append(reward)
+        base_info['done'].append(False)
+        return obs, reward, term, _, base_info
+
+    def _update_info_and_reward(self, base_info, new_info, reward):
+        base_info.update(new_info)
+        reward = self._update_step_reward(reward)
+        return base_info, reward
+
+    def _get_trunc(self):
         # This is used to set term, NOT trunc
         if self.step_count >= self.max_steps:
             return True
@@ -211,16 +281,32 @@ class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     def _update_step_reward(reward: float) -> float:
         # Simplify the reward to per-step basis
         if reward > 0:
-            return reward # 1.0
+            return 1.0  # float(reward)
         return 0.0
 
-    def reset(self, *args, **kwargs) -> np.ndarray:
-        self.step_mode = 0
-        self.step_count = 0
-        obs, info = self.env.reset(*args, **kwargs)
-        info['bonus_step_taken'] = False
-        info['obs'] = obs
-        return obs, info
+
+class RepeatFlagChannel(RecordConstructorArgs, ObservationWrapper):
+    """
+    Original obs shape (5, 5, 3). Append a 1-channel flag to make (5, 5, 4).
+    0 -> next action repeats once; 1 -> next action repeats twice.
+    """
+    def __init__(self, env, use_flag: bool = True):
+        RecordConstructorArgs.__init__(self)
+        ObservationWrapper.__init__(self, env)
+        # super().__init__(env)
+        assert isinstance(env.observation_space, spaces.Box)
+        h, w, c = env.observation_space.shape
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(h, w, c + 1), dtype=np.uint8
+        )
+        self.use_flag = use_flag
+
+    def observation(self, obs):
+        # Concat flag (0/1) to the start of the channels
+        # - always set to 0 if use_flag = False
+        val = 1 if self.env.get_wrapper_attr("last_step_mode") == 1 and self.use_flag else 0 # 0 for no repeat, 1 for repeat
+        flag = np.full((obs.shape[0], obs.shape[1], 1), val, dtype=np.uint8)
+        return np.concatenate([flag, obs], axis=-1)
 
 
 class RecordableImgObsWrapper(RecordConstructorArgs, ImgObsWrapper):
@@ -260,14 +346,17 @@ class DecoyObsWrapper(RecordConstructorArgs, Wrapper):
 
     @staticmethod
     def _fill_obs(info):
-        obs, direction = info['obs']['image'], info['obs']['direction']
-        target_shape = obs.shape[:-1] + (1,)
-        obs = np.concatenate((np.full(target_shape, fill_value=direction, dtype=obs.dtype),
-                              obs), -1)
+        for idx, vanilla_obs in enumerate(info['obs']):
+            obs, direction = vanilla_obs['image'], vanilla_obs['direction']
+            target_shape = obs.shape[:-1] + (1,)
+            # Concat flag to the start of the channels
+            obs = np.concatenate((np.full(target_shape, fill_value=direction, dtype=obs.dtype),
+                                  obs), -1)
 
-        flag = np.full(target_shape, 0, dtype=obs.dtype)
-        obs = np.concatenate([flag, obs], axis=-1)
-        info['obs'] = obs
+            # Always set decoy obs flag to zero and concat to the start of the channels
+            flag = np.full(target_shape, 0, dtype=obs.dtype)
+            obs = np.concatenate([flag, obs], axis=-1)
+            info['obs'][idx] = obs
         return info
 
 
@@ -553,7 +642,7 @@ class SaveEachBestCallback(BaseCallback):
 
 class CustomNet(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], output_size: int = 1, feature_size: int = 128,
-                 is_dummy=False, device: str = 'cpu', feature_extractor=None, *args, **kwargs) -> None:
+                 device: str = 'cpu', feature_extractor=None, *args, **kwargs) -> None:
         super().__init__()
         self._device = device
         if feature_extractor is None:
@@ -603,8 +692,9 @@ class CustomNet(nn.Module):
             nn.init.zeros_(self.decoder[-1].weight)
             nn.init.zeros_(self.decoder[-1].bias)
 
-    def forward(self, x: torch.Tensor, action: torch.Tensor = None, flag: torch.Tensor = None) -> torch.Tensor:
-        x, action, flag = self._ndarray_to_tensor(x, action, flag)
+    def forward(self, x: torch.Tensor, actions: torch.Tensor = None, flags: torch.Tensor = None) -> torch.Tensor:
+        x, actions, flags = self._ndarray_to_tensor(x, actions, flags)
+        x = x.to(dtype=torch.float32)
 
         # (N, C, H, W) -> (N, feature_size)
         hidden = self.encoder(x)
@@ -612,15 +702,15 @@ class CustomNet(nn.Module):
         # (N, feature_size) -> (N, output_size)
         output = self.decoder(hidden)
 
-        if flag is not None:
+        if flags is not None:
             output = output.view(x.size(0), 2, -1)
-            output = torch.take_along_dim(output, flag.unsqueeze(-1), 1).squeeze(1)
+            output = torch.take_along_dim(output, flags.long().unsqueeze(-1), 1).squeeze(1)
 
-        if action is None:
+        if actions is None:
             return output
 
         # (N, output_size) -> (N, 1)
-        return output.gather(1, action.long())
+        return output.gather(1, actions.long())
 
     def _ndarray_to_tensor(self, *arrays):
         new_tensors = []
@@ -629,7 +719,7 @@ class CustomNet(nn.Module):
                 new_tensors.append(None)
                 continue
             if not isinstance(array, torch.Tensor):
-                array = torch.tensor(array, dtype=torch.float32)
+                array = torch.tensor(array)
             new_tensors.append(array.to(self._device))
 
         return new_tensors
@@ -637,11 +727,10 @@ class CustomNet(nn.Module):
 
 class CustomIQL(nn.Module):
     def __init__(self, observation_shape: Tuple[int, int, int], action_size: int,  input_length: int = 2,
-                 is_dummy: bool = False, feature_size: int = 128, batch_size: int = 128, expectile: float = 0.7,
+                 feature_size: int = 128, batch_size: int = 128, expectile: float = 0.7,
                  gamma: float = 0.99, critic_lr: float = 3e-4, value_lr: float = 3e-4, actor_lr: float = 3e-4,
                  device: str = 'cpu'):
         super().__init__()
-        self._is_dummy = is_dummy
         self._feature_size = feature_size
         self._batch_size = batch_size
         self._expectile = expectile
@@ -649,17 +738,16 @@ class CustomIQL(nn.Module):
         self._batch_diff = None
         self._input_length = input_length
         self._device = device
+        self._cloning_only = expectile == 0.5
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, device=device)
 
         self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
 
-        _expand_output = (not is_dummy) + 1
-
-        self.critic_net1 = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.critic_net2 = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.value_net = CustomNet(output_size=1 * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.target_value_net = CustomNet(output_size=1 * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
-        self.policy_net = CustomNet(output_size=action_size * _expand_output, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net1 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.policy_net = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
 
         # Give both critic nets to the critic optimizer
         self.critic_optim = torch.optim.AdamW(list(self.critic_net1.encoder.parameters()) +
@@ -672,69 +760,74 @@ class CustomIQL(nn.Module):
         for target_param, param in zip(self.target_value_net.decoder.parameters(), self.value_net.decoder.parameters()):
             target_param.data.copy_(param.data)
 
-    def fit(self, dataset, n_steps: int = 100_000, n_steps_per_epoch: int = 1_000, evaluators=None,
-            show_progress: bool = True, experiment_name: str = None):
+    def fit(self, dataset, epochs: int = 1, n_steps_per_epoch: int = 1_000, evaluators=None,
+            show_progress: bool = True, experiment_name: str = None, dataset_kwargs: Optional[Dict] = None):
+        # Initialise our dataset and loss dictionary
+        dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
+        dataset.set_to_tensors(self._device)
 
-        total_epochs = n_steps // n_steps_per_epoch + 1
+        loss_dict = self._reset_loss_dict()
 
-        loss_dict = {
-            'critic_loss': [],
-            'value_loss': [],
-            'policy_loss': []
-        }
+        # Start training
+        with tqdm(total=epochs * n_steps_per_epoch, desc="Progress", mininterval=2.0, disable=not show_progress) as pbar:
+            for epoch in range(1, epochs + 1):
+                epoch_str = f"{epoch}/{epochs}"
 
-        for epoch in range(1, total_epochs + 1):
-            desc_str = f"{epoch}/{total_epochs}"
-            for update_step in tqdm(
-                    range(n_steps_per_epoch),
-                    disable=not show_progress,
-                    mininterval=2.0,
-                    desc=desc_str,
-                    leave=False
-            ):
-                minibatch = dataset.sample_transition_batch(self._batch_size)
-                obs, acts, rews, next_obs, dones, flag = self._unpack_batch(minibatch)
+                for update_step in range(n_steps_per_epoch):
+                    obs, acts, rews, next_obs, dones, flags, next_flags = dataset.sample_transition_batch(
+                        self._batch_size, **dataset_kwargs
+                    )
 
-                # Update the networks
-                loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, flag))
-                loss_dict['value_loss'].append(self._update_value(obs, acts, flag))
-                loss_dict['policy_loss'].append(self._update_actor(obs, acts, flag))
+                    # Update the networks
+                    if not self._cloning_only:
+                        loss_dict['critic_loss'].append(self._update_critic(obs, acts, rews, next_obs, dones, flags, next_flags))
+                        loss_dict['value_loss'].append(self._update_value(obs, acts, flags))
+                    loss_dict['policy_loss'].append(self._update_actor(obs, acts, flags))
 
-                # Soft update of target value network
-                for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-                    target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
+                    # Soft update of target value network
+                    for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
+                        target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
 
-            # Logging
-            loss_dict = self._log_progress(
-                epoch=epoch,
-                loss_dict=loss_dict,
-                experiment_name=experiment_name,
-                evaluators=evaluators
-            )
+                    pbar.update(1)
+                    pbar.set_postfix(epoch=epoch_str,
+                                     policy_loss=f"{np.mean(loss_dict['policy_loss']):.5f}",
+                                     critic_loss=f"{np.mean(loss_dict['critic_loss']):.5f}",
+                                     value_loss=f"{np.mean(loss_dict['value_loss']):.5f}",
+                                     refresh=False)
 
-    def forward(self, obs, acts, flag=None):
-        if flag is None:
-            flag = self._extract_flag(obs)
-        q1, q2 = self.critic_net1(obs, acts, flag=flag), self.critic_net2(obs, acts, flag=flag)
-        v = self.value_net(obs, flag=flag)
-        logits = self.policy_net(obs, flag=flag)
+                # Logging
+                loss_dict, log_dict = self._log_progress(
+                    epoch=epoch,
+                    loss_dict=loss_dict,
+                    experiment_name=experiment_name,
+                    evaluators=evaluators
+                )
+
+        return log_dict
+
+    def forward(self, obs, acts, flags=None):
+        if flags is None:
+            flags = self._extract_flags(obs)
+        q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
+        v = self.value_net(obs, flags=flags)
+        logits = self.policy_net(obs, flags=flags)
         return (q1, q2), v, logits
 
-    def predict(self, obs, flag=None, deterministic: bool = False):
-        if flag is None:
-            flag = self._extract_flag(obs)
-        logits = self.policy_net(obs, flag=flag)
+    def predict(self, obs, flags=None, deterministic: bool = False):
+        obs = self._to_tensors(obs)[0]
+        if flags is None:
+            flags = self._extract_flag(obs)
+        logits = self.policy_net(obs, flags=flags)
         if deterministic:
             return logits.argmax(dim=-1).cpu().numpy()
         return Categorical(logits=logits).sample().cpu().numpy()
 
-    def _update_critic(self, obs, acts, rews, next_obs, dones, flag=None):
-        q1, q2 = self.critic_net1(obs, acts, flag=flag), self.critic_net2(obs, acts, flag=flag)
+    def _update_critic(self, obs, acts, rews, next_obs, dones, flags=None, next_flags=None):
+        q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
         with torch.no_grad():
-            next_flag = self._extract_flag(next_obs)
-            v_next = self.target_value_net(next_obs, flag=next_flag)
-            flag = torch.where(flag == 1, 3, 1)
-            q_target = rews + self._gamma ** flag * (1 - dones) * v_next
+            v_next = self.target_value_net(next_obs, flags=next_flags)
+            multistep_discount = torch.where(next_flags == 1, 3, 1)
+            q_target = rews.float() + self._gamma ** multistep_discount * (1 - dones.float()) * v_next
 
         loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
         self.critic_optim.zero_grad()
@@ -742,10 +835,10 @@ class CustomIQL(nn.Module):
         self.critic_optim.step()
         return loss.item()
 
-    def _update_value(self, obs, acts, flag=None):
-        v = self.value_net(obs, flag=flag)
+    def _update_value(self, obs, acts, flags=None):
+        v = self.value_net(obs, flags=flags)
         with torch.no_grad():
-            q1, q2 = self.critic_net1(obs, acts, flag=flag), self.critic_net2(obs, acts, flag=flag)
+            q1, q2 = self.critic_net1(obs, acts, flags=flags), self.critic_net2(obs, acts, flags=flags)
             q = torch.min(q1, q2)
 
         diff = q - v
@@ -758,34 +851,23 @@ class CustomIQL(nn.Module):
         self.value_optim.step()
         return value_loss.item()
 
-    def _update_actor(self, obs, acts, flag=None):
-        logits = self.policy_net(obs, flag=flag)
-        weights = self._batch_diff
-        # weights = (weights - weights.mean()) / (weights.std() + 1e-6)
-        policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
-        policy_loss = (policy_loss * torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)).mean()
+    def _update_actor(self, obs, acts, flags=None):
+        logits = self.policy_net(obs, flags=flags)
+        weights = 1.0
+        if not self._cloning_only:
+            weights = self._batch_diff
+            weights = torch.clip(torch.exp(2.0 * weights), -torch.inf, 100)
 
-        # policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='mean')
+        policy_loss = F.cross_entropy(logits, acts.squeeze().long(), reduction='none')
+        policy_loss = (policy_loss * weights).mean()
 
         self.policy_optim.zero_grad()
         policy_loss.backward()
         self.policy_optim.step()
         return policy_loss.item()
 
-    def _unpack_batch(self, batch):
-        obs, acts, rews, next_obs, dones = (batch.observations, batch.actions, batch.rewards,
-                                            batch.next_observations, batch.terminals)
-
-        # Convert to torch tensors
-        obs, acts, rews, next_obs, dones = self._to_tensors(obs, acts, rews, next_obs, dones)
-        flag = self._extract_flag(obs)
-
-        return obs, acts, rews, next_obs, dones, flag
-
     def _extract_flag(self, obs):
         obs = self._to_tensors(obs)[0]
-        if self._is_dummy:
-            return None
         if obs.shape[-1] in (1, 5):
             return obs[:, -1, -1, 0].unsqueeze(-1).long()
         return obs[:, 0, -1, -1].unsqueeze(-1).long()
@@ -800,213 +882,42 @@ class CustomIQL(nn.Module):
 
     def _log_progress(self, epoch: int, loss_dict: dict, experiment_name: str,
                       evaluators: dict = None):
-        if evaluators and 'environment' in evaluators:
-            mean_reward, std_reward = evaluators['environment'](self)
-            print('\n', '=' * 40)
-            print(f"Epoch {epoch}: \n     mean_reward = {mean_reward:.2f} +/- {std_reward:.2f}")
-            print(f"     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}")
-            print(f"     value_loss = {np.mean(loss_dict['value_loss']):.7f}")
-            print(f"     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}\n")
-            print('=' * 40, '\n')
 
-        # Not yet implemented saving logs
-        pass
+        rewards = {}
+        for key in evaluators.keys():
+            mean_rew, std_rew = evaluators[key](self)
+            rewards[key] = (mean_rew, std_rew)
 
-        return dict(critic_loss=[], value_loss=[], policy_loss=[])
+        eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
+        for key in rewards.keys():
+            eval_str += f"\n     {key} = {rewards[key][0]:.2f} +/- {rewards[key][1]:.2f}"
 
+        eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
+        eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"
+        eval_str += f"\n     value_loss = {np.mean(loss_dict['value_loss']):.7f}\n"
+        eval_str += '=' * 40 + '\n'
+        print(eval_str)
 
-@dataclasses.dataclass(frozen=True)
-class CustomPartialTrajectory(PartialTrajectory):
-    r"""Partial trajectory.
+        return self._reset_loss_dict(), rewards
 
-    Args:
-        observations: Sequence of observations.
-        actions: Sequence of actions.
-        rewards: Sequence of rewards.
-        returns_to_go: Sequence of remaining returns.
-        terminals: Sequence of terminal flags.
-        timesteps: Sequence of timesteps.
-        masks: Sequence of masks that represent padding.
-        length: Sequence length.
-    """
-
-    observations: ObservationSequence  # (L, ...)
-    actions: NDArray  # (L, ...)
-    rewards: Float32NDArray  # (L, 1)
-    returns_to_go: Float32NDArray  # (L, 1)
-    next_observations: ObservationSequence  # (L, ...)
-    terminals: Float32NDArray  # (L, 1)
-    timesteps: Int32NDArray  # (L,)
-    masks: Float32NDArray  # (L,)
-    next_masks: Float32NDArray  # (L,)
-    length: int
-
-
-def next_mask_pad_array(array: NDArray, pad_size: int) -> NDArray:
-    return np.concatenate((batch_pad_array(array, pad_size), np.ones((1,), dtype=np.float32)), axis=0)
-
-
-class CustomTrajectorySlicer(TrajectorySlicerProtocol):
-    r"""Standard trajectory slicer.
-
-    This class implements a basic trajectory slicing.
-    """
-
-    def __call__(
-        self, episode: EpisodeBase, end_index: int, size: int
-    ) -> PartialTrajectory:
-        end = end_index + 1
-        next_end = end_index + 2
-        start = max(end - size, 0)
-        next_start = max(next_end - size, 0)
-        actual_size = end - start
-        actual_next_size = next_end - next_start
-
-        # slice data
-        observations = slice_observations(episode.observations, start, end)
-        actions = episode.actions[start:end]
-        rewards = episode.rewards[start:end]
-        ret = np.sum(episode.rewards[start:])
-        # cumsum includes the current timestep
-        all_returns_to_go = (
-            ret
-            - np.cumsum(episode.rewards[start:], axis=0)
-            + episode.rewards[start:]
-        )
-        returns_to_go = all_returns_to_go[:actual_size].reshape((-1, 1))
-
-        # prepare terminal flags
-        terminals: Float32NDArray = np.zeros((actual_size, 1), dtype=np.float32)
-        if episode.terminated and end_index == episode.size() - 1:
-            terminals[-1][0] = 1.0
-            next_observations = np.zeros((actual_next_size, *observations.shape[1:]))
-        else:
-            next_observations = slice_observations(episode.observations, next_start, next_end)
-
-        # prepare metadata
-        timesteps: Int32NDArray = np.arange(start, end) + 1
-        masks: Float32NDArray = np.ones(end - start, dtype=np.float32)
-        next_masks: Float32NDArray = np.concatenate((masks[1:], np.ones((1,), dtype=np.float32)), axis=0)
-
-        # compute backward padding size
-        pad_size = size - actual_size
-
-        if pad_size == 0:
-            return CustomPartialTrajectory(
-                observations=observations,
-                actions=actions,
-                rewards=rewards,
-                returns_to_go=returns_to_go,
-                next_observations=next_observations,
-                terminals=terminals,
-                timesteps=timesteps,
-                masks=masks,
-                next_masks=next_masks,
-                length=size,
-            )
-
-        return CustomPartialTrajectory(
-            observations=batch_pad_observations(observations, pad_size),
-            actions=batch_pad_array(actions, pad_size),
-            rewards=batch_pad_array(rewards, pad_size),
-            returns_to_go=batch_pad_array(returns_to_go, pad_size),
-            next_observations=batch_pad_observations(next_observations, pad_size - 1),
-            terminals=batch_pad_array(terminals, pad_size),
-            timesteps=batch_pad_array(timesteps, pad_size),
-            masks=batch_pad_array(masks, pad_size),
-            next_masks=next_mask_pad_array(next_masks, pad_size - 1),
-            length=size,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class CustomTrajectoryMiniBatch(TrajectoryMiniBatch):
-    r"""Mini-batch of trajectories.
-
-    Args:
-        observations: Batched sequence of observations.
-        actions: Batched sequence of actions.
-        rewards: Batched sequence of rewards.
-        returns_to_go: Batched sequence of returns-to-go.
-        terminals: Batched sequence of environment terminal flags.
-        timesteps: Batched sequence of environment timesteps.
-        masks: Batched masks that represent padding.
-        length: Length of trajectories.
-    """
-
-    observations: Union[Float32NDArray, Sequence[Float32NDArray]]  # (B, L, ...)
-    actions: Float32NDArray  # (B, L, ...)
-    rewards: Float32NDArray  # (B, L, 1)
-    returns_to_go: Float32NDArray  # (B, L, 1)
-    next_observations: Union[Float32NDArray, Sequence[Float32NDArray]]  # (B, L, ...)
-    terminals: Float32NDArray  # (B, L, 1)
-    timesteps: Float32NDArray  # (B, L)
-    masks: Float32NDArray  # (B, L)
-    next_masks: Float32NDArray  # (B, L)
-    length: int
-
-    def __post_init__(self) -> None:
-        assert check_dtype(self.observations, np.float32)
-        assert check_dtype(self.actions, np.float32)
-        assert check_dtype(self.rewards, np.float32)
-        assert check_dtype(self.returns_to_go, np.float32)
-        assert check_dtype(self.next_observations, np.float32)
-        assert check_dtype(self.terminals, np.float32)
-        assert check_dtype(self.timesteps, np.float32)
-        assert check_dtype(self.masks, np.float32)
-        assert check_dtype(self.next_masks, np.float32)
-
-    @classmethod
-    def from_partial_trajectories(
-        cls, trajectories: Sequence[CustomPartialTrajectory]
-    ) -> "TrajectoryMiniBatch":
-        r"""Constructs mini-batch from list of trajectories.
-
-        Args:
-            trajectories: List of trajectories.
-
-        Returns:
-            Mini-batch of trajectories.
-        """
-        observations = stack_observations(
-            [traj.observations for traj in trajectories]
-        )
-        actions = np.stack([traj.actions for traj in trajectories], axis=0)
-        rewards = np.stack([traj.rewards for traj in trajectories], axis=0)
-        returns_to_go = np.stack(
-            [traj.returns_to_go for traj in trajectories], axis=0
-        )
-        next_observations = stack_observations(
-            [traj.next_observations for traj in trajectories]
-        )
-        terminals = np.stack([traj.terminals for traj in trajectories], axis=0)
-        timesteps = np.stack([traj.timesteps for traj in trajectories], axis=0)
-        masks = np.stack([traj.masks for traj in trajectories], axis=0)
-        next_masks = np.stack([traj.next_masks for traj in trajectories], axis=0)
-        return CustomTrajectoryMiniBatch(
-            observations=cast_recursively(observations, np.float32),
-            actions=cast_recursively(actions, np.float32),
-            rewards=cast_recursively(rewards, np.float32),
-            returns_to_go=cast_recursively(returns_to_go, np.float32),
-            next_observations=cast_recursively(next_observations, np.float32),
-            terminals=cast_recursively(terminals, np.float32),
-            timesteps=cast_recursively(timesteps, np.float32),
-            masks=cast_recursively(masks, np.float32),
-            next_masks=cast_recursively(next_masks, np.float32),
-            length=trajectories[0].length,
-        )
+    @staticmethod
+    def _reset_loss_dict():
+        return {
+            'critic_loss': deque(maxlen=100),
+            'value_loss': deque(maxlen=100),
+            'policy_loss': deque(maxlen=100)
+        }
 
 
 class CustomEnvironmentEvaluator:
-    def __init__(self, env: RepeatFlagChannel, n_trials: int, has_decoy: bool = False):
+    def __init__(self, env: RepeatFlagChannel, n_trials: int):
         self.env = env
         self.n_trials = n_trials
-        self.has_decoy = has_decoy
 
     def __call__(self, algo) -> float:
         mean_returns = []
         for _ in range(self.n_trials):
-            obs = self._decoy_obs_maybe(*self.env.reset())
+            obs, info = self.env.reset()
             done = False
             total_reward = 0.0
 
@@ -1014,7 +925,6 @@ class CustomEnvironmentEvaluator:
                 with torch.no_grad():
                     action = algo.predict(np.expand_dims(obs, 0))
                 obs, reward, terminated, truncated, info = self.env.step(action)
-                obs = self._decoy_obs_maybe(obs, info)
                 done = terminated or truncated
                 total_reward += reward
 
@@ -1022,29 +932,15 @@ class CustomEnvironmentEvaluator:
 
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
 
-    def _decoy_obs_maybe(self, obs, info):
-        if self.has_decoy:
-            return info['obs']
-        else:
-            return obs
 
-
-def make_lavastep_env(*, max_steps=100, has_decoy: bool = False, decoy_interval: int = 1, **kwargs):
+def make_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = True, **kwargs):
     env_name = "MiniGrid-LavaGapS5-v0"
     # env_name = "MiniGrid-Empty-5x5-v0"
     env = gym.make(env_name, max_episode_steps=None, **kwargs)
     # env = FullyObsWrapper(env)
-    env = AlternateStepWrapper(env, max_steps=max_steps, has_decoy=has_decoy, decoy_interval=decoy_interval)
+    env = AlternateStepWrapper(env, max_steps=max_steps, forced_interval=forced_interval)
     env = RecordableImgObsWrapper(env)         # (H,W,C) uint8 image
-    env = RepeatFlagChannel(env)     # +1 channel flag
-    env = FloatRewardChannel(env)
+    env = RepeatFlagChannel(env, use_flag=use_flag)     # +1 channel flag
     env = DecoyObsWrapper(env)
     return env
-
-def sample_trajectory_batch(
-        self, batch_size: int, length: int
-) -> CustomTrajectoryMiniBatch:
-    return CustomTrajectoryMiniBatch.from_partial_trajectories(
-        [self.sample_trajectory(length) for _ in range(batch_size)]
-    )
 

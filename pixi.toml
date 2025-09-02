@@ -24,14 +24,17 @@ gymnasium = { version = "<1.0", extras = ["atari", "accept-rom-license"] }
 minigrid = ">=3.0.0, <4"
 
 [feature.pufferlib.tasks]
-pufferlib = "uv build ./d3rlpy; uv pip install ./d3rlpy/dist/*.whl; uv pip install 'pufferlib[minigrid]' --no-build-isolation; uv pip install gym==0.26.0"
+# pufferlib = "uv build ./d3rlpy; uv pip install ./d3rlpy/dist/*.whl; uv pip install 'pufferlib[minigrid]' --no-build-isolation; uv pip install gym==0.26.0"
 
 [feature.pufferlib.pypi-dependencies]
 setuptools = ">=80.9.0, <81"
 click = ">=8.2.1, <9"
 requests = ">=2.32.5, <3"
 stable-baselines3 = ">=2.7.0, <3"
-minari = { version = ">=0.5.3, <0.6", extras = ["arrow", "create", "hdf5"] }
+# minari = { version = ">=0.5.3, <0.6", extras = ["arrow", "create", "hdf5"] }
+polars = ">=1.33.0, <2"
+gymnasium = "<1.0"
+minigrid = ">=3.0.0, <4"
 # d3rlpy = "==2.6.1"
 
 [environments]
