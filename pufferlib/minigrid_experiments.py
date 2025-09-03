@@ -36,8 +36,8 @@ Trained on artificial 1-step decoy dataset - flag forced to 0
 
 
 register(
-    id="LavaGapS5AltStep-v0",
-    # id="EmptyS5NoAltStep-v0",
+    id="LavaGapS7AltStep-v0",
+    # id="EmptyS7NoAltStep-v0",
     entry_point="importable_wrappers:make_lavastep_env",
     # This metadata is what Minari will use to reconstruct later
     additional_wrappers=(
@@ -81,10 +81,10 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=128),
     )
 
-    env_name = "LavaGapS5AltStep-v0"
-    # env_name = "EmptyS5NoAltStep-v0"
-    dataset_id = "minigrid_dataset/LavaGapS5AltStepMedium-v0"
-    # dataset_id = "minigrid_dataset/EmptyS5NoAltStepExpert-v0"
+    env_name = "LavaGapS7AltStep-v0"
+    # env_name = "EmptyS7NoAltStep-v0"
+    dataset_id = "minigrid_dataset/LavaGapS7AltStepMedium-v0"
+    # dataset_id = "minigrid_dataset/EmptyS7NoAltStepExpert-v0"
     if train_ppo:
         # Create eval callback
         # callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=1.0, verbose=1)
@@ -106,7 +106,7 @@ if __name__ == "__main__":
 
         # Get our PPO model
         base_env = gym.make(env_name, max_steps=50)
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_013_steps=22000_mean=0.86.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_027_steps=118000_mean=0.93.zip',
                                  env=base_env, device="auto")
 
         # Fill our replay buffer (or load pre-filled)
@@ -172,7 +172,7 @@ if __name__ == "__main__":
     if render_performance:
         # Managing your own trainer
         eval_env = gym.make(env_name, max_steps=100, render_mode="human")
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_013_steps=22000_mean=0.86.zip',
+        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_027_steps=118000_mean=0.93.zip',
                                  env=eval_env, device="auto")
         observation, info = eval_env.reset(seed=42)
         for _ in tqdm(range(1000)):

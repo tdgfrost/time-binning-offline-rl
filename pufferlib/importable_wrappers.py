@@ -934,8 +934,8 @@ class CustomEnvironmentEvaluator:
 
 
 def make_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = True, **kwargs):
-    env_name = "MiniGrid-LavaGapS5-v0"
-    # env_name = "MiniGrid-Empty-5x5-v0"
+    env_name = "MiniGrid-LavaGapS7-v0"
+    # env_name = "MiniGrid-Empty-7x7-v0"
     env = gym.make(env_name, max_episode_steps=None, **kwargs)
     # env = FullyObsWrapper(env)
     env = AlternateStepWrapper(env, max_steps=max_steps, forced_interval=forced_interval)
