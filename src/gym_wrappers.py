@@ -213,7 +213,7 @@ def make_video_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag
                             fixed_reward: bool = True, video_folder=current_video_folder,
                             episode_trigger=all_episodes_trigger, step_trigger=None, video_length=0,
                             name_prefix='rl-video', disable_logger=False, **kwargs):
-    env_name = "MiniGrid-LavaGapS6-v0"
+    env_name = "MiniGrid-LavaGapS7-v0"
     env = gym.make(env_name, max_episode_steps=None, **kwargs)
     env = RecordVideo(env, video_folder=video_folder, episode_trigger=episode_trigger,
                       step_trigger=step_trigger, video_length=video_length, name_prefix=name_prefix,
@@ -228,7 +228,7 @@ def make_video_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag
 
 def make_lavastep_env(*, max_steps=100, forced_interval: int = 0, use_flag: bool = True,
                       fixed_reward: bool = True, **kwargs):
-    env_name = "MiniGrid-LavaGapS6-v0"
+    env_name = "MiniGrid-LavaGapS7-v0"
     env = gym.make(env_name, max_episode_steps=None, **kwargs)
     # env = FullyObsWrapper(env)
     env = AlternateStepWrapper(env, max_steps=max_steps, forced_interval=forced_interval, fixed_reward=fixed_reward)
