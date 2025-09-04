@@ -11,6 +11,8 @@ from utils import *
 from gym_wrappers import *
 from models import *
 
+desired_ppo_agent_performance = '../logs/ppo_minigrid_logs/historic_bests/INSERT_DESIRED_MODEL_HERE.zip'
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, help='Train PPO agent')
@@ -138,8 +140,7 @@ if __name__ == "__main__":
 
         # Get our PPO model
         base_env = gym.make(env_name, max_steps=50)
-        model = CallablePPO.load('../logs/ppo_minigrid_logs/historic_bests/INSERT_CHOSEN_MODEL_HERE.zip',
-                                 env=base_env, device="auto")
+        model = CallablePPO.load(desired_ppo_agent_performance, env=base_env, device="auto")
         model_loaded = True
 
         # Fill our replay buffer (or load pre-filled)
@@ -209,8 +210,7 @@ if __name__ == "__main__":
                             tile_size=128)
 
         if not model_loaded:
-            model = CallablePPO.load('../logs/ppo_minigrid_logs/historic_bests/INSERT_CHOSEN_MODEL_HERE.zip',
-                                     env=eval_env, device="auto")
+            model = CallablePPO.load(desired_ppo_agent_performance, env=eval_env, device="auto")
 
         total_episodes = 10
         for ep_number in range(total_episodes):
