@@ -107,7 +107,6 @@ if __name__ == "__main__":
     DECOY_INTERVAL = args.decoy_interval
 
     model_loaded = False
-    print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}")
 
     policy_kwargs = dict(
         features_extractor_class=PPOMiniGridFeaturesExtractor,
