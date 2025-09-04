@@ -19,4 +19,6 @@ stable-baselines3 = ">=2.7.0, <3"
 polars = ">=1.33.0, <2"
 gymnasium = "<1.0"
 minigrid = ">=3.0.0, <4"
+seaborn = ">=0.13.2, <0.14"
+pyarrow = ">=21.0.0, <22"
 
