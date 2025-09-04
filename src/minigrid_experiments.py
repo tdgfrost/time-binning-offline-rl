@@ -7,13 +7,17 @@ import argparse
 from collections import defaultdict
 import polars as pl
 
-from importable_wrappers import *
+from utils import *
+from gym_wrappers import *
+from models import *
 
-train_ppo = False
-train_iql = True
-render_performance = False
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--train_ppo', default=True, help='Train PPO agent')
+parser.add_argument('--train_iql', default=False, help='Train IQL agent')
+parser.add_argument('--render_performance', default=False, help='Whether to render performance in final eval')
+parser.add_argument('--record_video', default=False, help='Whether to record video of performance rendering')
+
 parser.add_argument('--expectile', default=0.5, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
 
@@ -34,85 +38,113 @@ Trained on artificial 1-step decoy dataset - flag forced to 0
 - evaluated on forced 1-step environment - flag forced to 0
 """
 
+additional_wrappers = (
+    WrapperSpec(
+        name="RecordVideo",
+        entry_point="gymnasium.wrappers.record_video:RecordVideo",
+        kwargs={
+            'video_folder': current_video_folder,
+            'episode_trigger': all_episodes_trigger,
+            'step_trigger': None,
+            'video_length': 0,
+            'name_prefix': 'rl-video',
+            'disable_logger': False
+        },
+    ),
+    # For debugging purposes only
+    # WrapperSpec(
+        # name="FullyObsWrapper",
+        # entry_point="minigrid.wrappers:FullyObsWrapper",
+        # kwargs=None,
+    # ),
+    WrapperSpec(
+        name="AlternateStepWrapper",
+        entry_point="importable_wrappers:AlternateStepWrapper",
+        kwargs={},
+    ),
+    WrapperSpec(
+        name="RecordableImgObsWrapper",
+        entry_point="importable_wrappers:RecordableImgObsWrapper",
+        kwargs={},
+    ),
+    WrapperSpec(
+        name="RepeatFlagChannel",
+        entry_point="importable_wrappers:RepeatFlagChannel",
+        kwargs={},
+    ),
+    WrapperSpec(
+        name="DecoyObsWrapper",
+        entry_point="importable_wrappers:DecoyObsWrapper",
+        kwargs={},
+    ),
+)
+no_video_additional_wrappers = additional_wrappers[1:]
+
 
 register(
     id="LavaGapS6AltStep-v0",
-    # id="EmptyS6NoAltStep-v0",
     entry_point="importable_wrappers:make_lavastep_env",
-    # This metadata is what Minari will use to reconstruct later
-    additional_wrappers=(
-        # WrapperSpec(
-            # name="FullyObsWrapper",
-            # entry_point="minigrid.wrappers:FullyObsWrapper",
-            # kwargs=None,
-        # ),
-        WrapperSpec(
-            name="AlternateStepWrapper",
-            entry_point="importable_wrappers:AlternateStepWrapper",
-            kwargs={},
-        ),
-        WrapperSpec(
-            name="RecordableImgObsWrapper",
-            entry_point="importable_wrappers:RecordableImgObsWrapper",
-            kwargs={},
-        ),
-        WrapperSpec(
-            name="RepeatFlagChannel",
-            entry_point="importable_wrappers:RepeatFlagChannel",
-            kwargs={},
-        ),
-        WrapperSpec(
-            name="DecoyObsWrapper",
-            entry_point="importable_wrappers:DecoyObsWrapper",
-            kwargs={},
-        ),
-    ),
+    additional_wrappers=no_video_additional_wrappers,
+)
+register(
+    id="LavaGapS6AltStepWithVideo-v0",
+    entry_point="importable_wrappers:make_video_lavastep_env",
+    additional_wrappers=additional_wrappers,
 )
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    train_ppo = args.train_ppo
+    train_iql = args.train_iql
+    render_performance = args.render_performance
+    record_video = args.record_video
+
+    assert not (train_ppo and train_iql), "Please choose to train either PPO or IQL, not both."
+
     EXPECTILE = args.expectile
     DECOY_INTERVAL = args.decoy_interval
+
+    model_loaded = False
     print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}")
 
     policy_kwargs = dict(
-        features_extractor_class=MinigridFeaturesExtractor,
+        features_extractor_class=PPOMiniGridFeaturesExtractor,
         features_extractor_kwargs=dict(features_dim=128),
     )
 
     env_name = "LavaGapS6AltStep-v0"
-    # env_name = "EmptyS6NoAltStep-v0"
-    dataset_id = "minigrid_dataset/LavaGapS6AltStepMedium-v0"
-    # dataset_id = "minigrid_dataset/EmptyS6NoAltStepExpert-v0"
+    video_env_name = "LavaGapS6AltStepWithVideo-v0"
     if train_ppo:
         # Create eval callback
-        # callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=1.0, verbose=1)
-        save_each_best = SaveEachBestCallback(save_dir="./ppo_minigrid_logs/historic_bests", verbose=1)
-        eval_callback = EvalCallback(gym.make(env_name, max_steps=100),
-                                     n_eval_episodes=50,
+        save_each_best = SaveEachBestCallback(save_dir="../logs/ppo_minigrid_logs/historic_bests", verbose=1)
+        eval_callback = EvalCallback(gym.make(env_name, max_steps=100, fixed_reward=False),
+                                     n_eval_episodes=100,
                                      callback_on_new_best=CallbackList([save_each_best]),
                                      verbose=1,
-                                     eval_freq=1000,
+                                     eval_freq=2000,
                                      deterministic=False,
-                                     best_model_save_path="./ppo_minigrid_logs")
+                                     best_model_save_path="../logs/ppo_minigrid_logs")
 
         model = PPO("CnnPolicy", gym.make(env_name, max_steps=100), ent_coef=0.1,
                     policy_kwargs=policy_kwargs, gamma=GAMMA, verbose=1)
-        model.learn(5e5, callback=eval_callback)  # Train for 500,000 step with early stopping
+        model.learn(2e5, callback=eval_callback)  # Train for 500,000 step with early stopping
+        model_loaded = True
 
     if train_iql:
         logs = defaultdict(list)
 
         # Get our PPO model
         base_env = gym.make(env_name, max_steps=50)
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_014_steps=36000_mean=0.98.zip',
+        model = CallablePPO.load('../logs/ppo_minigrid_logs/historic_bests/INSERT_CHOSEN_MODEL_HERE.zip',
                                  env=base_env, device="auto")
+        model_loaded = True
 
         # Fill our replay buffer (or load pre-filled)
         replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000)
         if not os.path.exists('./dataset.pkl'):
-            replay_buffer_env.fill_buffer(model=model, n_frames=50_000)
+            replay_buffer_env.fill_buffer(model=model, n_frames=100_000)
             with open('./dataset.pkl', 'wb') as f:
                 pickle.dump(replay_buffer_env, f)
                 f.close()
@@ -132,13 +164,13 @@ if __name__ == "__main__":
         evaluators = {}
         for key, (interval, flag) in [
             ["natural_alt_step", (0, not DECOY_INTERVAL)],
-            ["forced_one_step", (1, False)],  # Will always be set to 0, which is correct
+            ["forced_one_step", (1, False)],
         ]:
-            evaluators[key] = CustomEnvironmentEvaluator(gym.make(env_name,
-                                                                  max_steps=50,
-                                                                  use_flag=flag,
-                                                                  forced_interval=interval),
-                                                         n_trials=500)
+            evaluators[key] = EnvironmentEvaluator(gym.make(env_name,
+                                                            max_steps=50,
+                                                            use_flag=flag,
+                                                            forced_interval=interval),
+                                                   n_trials=500)
 
         for n_trial in range(10):
             logs['expectile'].append(EXPECTILE)
@@ -166,20 +198,25 @@ if __name__ == "__main__":
                 logs[f'{key}_eval'].append(log_dict[key][0])
 
         # Save logs
-        os.makedirs('./iql_minigrid_logs', exist_ok=True)
-        pl.DataFrame(logs).write_csv(f'./iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}.csv')
+        os.makedirs('../logs/iql_minigrid_logs', exist_ok=True)
+        pl.DataFrame(logs).write_csv(f'../logs/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}.csv')
 
     if render_performance:
-        # Managing your own trainer
-        eval_env = gym.make(env_name, max_steps=100, render_mode="human")
-        model = CallablePPO.load('./ppo_minigrid_logs/historic_bests/best_014_steps=36000_mean=0.98.zip',
-                                 env=eval_env, device="auto")
-        observation, info = eval_env.reset(seed=42)
-        for _ in tqdm(range(1000)):
-            action = model.predict(observation)[0]  # User-defined policy function
-            # action = env.action_space.sample()
-            observation, reward, terminated, truncated, info = eval_env.step(action)
+        eval_env = gym.make(video_env_name if record_video else env_name,
+                            render_mode="rgb_array" if record_video else "human",
+                            max_steps=100,
+                            tile_size=128)
 
-            if terminated or truncated:
-                observation, info = eval_env.reset()
+        if not model_loaded:
+            model = CallablePPO.load('../logs/ppo_minigrid_logs/historic_bests/INSERT_CHOSEN_MODEL_HERE.zip',
+                                     env=eval_env, device="auto")
+
+        total_episodes = 10
+        for ep_number in range(total_episodes):
+            observation, info = eval_env.reset(seed=42+ep_number)
+            done = False
+            while not done:
+                action = model.predict(observation)[0]
+                observation, reward, terminated, truncated, info = eval_env.step(action)
+                done = terminated or truncated
         eval_env.close()

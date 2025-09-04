@@ -1,7 +1,0 @@
-.DS_Store
-.gitattributes
-.idea/
-torchrl-experiments/logs
-# pixi environments
-.pixi
-*.egg-info
