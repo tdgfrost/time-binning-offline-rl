@@ -140,12 +140,12 @@ if __name__ == "__main__":
 
         # Get our PPO model
         base_env = gym.make(env_name, max_steps=50)
-        model = CallablePPO.load(desired_ppo_agent_performance, env=base_env, device="auto")
-        model_loaded = True
 
         # Fill our replay buffer (or load pre-filled)
         replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000)
         if not os.path.exists('./dataset.pkl'):
+            model = CallablePPO.load(desired_ppo_agent_performance, env=base_env, device="auto")
+            model_loaded = True
             replay_buffer_env.fill_buffer(model=model, n_frames=100_000)
             with open('./dataset.pkl', 'wb') as f:
                 pickle.dump(replay_buffer_env, f)
