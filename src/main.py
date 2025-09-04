@@ -13,7 +13,7 @@ from models import *
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--train_ppo', default=True, help='Train PPO agent')
+parser.add_argument('--train_ppo', default=False, help='Train PPO agent')
 parser.add_argument('--train_iql', default=False, help='Train IQL agent')
 parser.add_argument('--render_performance', default=False, help='Whether to render performance in final eval')
 parser.add_argument('--record_video', default=False, help='Whether to record video of performance rendering')
@@ -59,22 +59,22 @@ additional_wrappers = (
     # ),
     WrapperSpec(
         name="AlternateStepWrapper",
-        entry_point="importable_wrappers:AlternateStepWrapper",
+        entry_point="gym_wrappers:AlternateStepWrapper",
         kwargs={},
     ),
     WrapperSpec(
         name="RecordableImgObsWrapper",
-        entry_point="importable_wrappers:RecordableImgObsWrapper",
+        entry_point="gym_wrappers:RecordableImgObsWrapper",
         kwargs={},
     ),
     WrapperSpec(
         name="RepeatFlagChannel",
-        entry_point="importable_wrappers:RepeatFlagChannel",
+        entry_point="gym_wrappers:RepeatFlagChannel",
         kwargs={},
     ),
     WrapperSpec(
         name="DecoyObsWrapper",
-        entry_point="importable_wrappers:DecoyObsWrapper",
+        entry_point="gym_wrappers:DecoyObsWrapper",
         kwargs={},
     ),
 )
@@ -83,12 +83,12 @@ no_video_additional_wrappers = additional_wrappers[1:]
 
 register(
     id="LavaGapS6AltStep-v0",
-    entry_point="importable_wrappers:make_lavastep_env",
+    entry_point="gym_wrappers:make_lavastep_env",
     additional_wrappers=no_video_additional_wrappers,
 )
 register(
     id="LavaGapS6AltStepWithVideo-v0",
-    entry_point="importable_wrappers:make_video_lavastep_env",
+    entry_point="gym_wrappers:make_video_lavastep_env",
     additional_wrappers=additional_wrappers,
 )
 
@@ -133,6 +133,8 @@ if __name__ == "__main__":
         model_loaded = True
 
     if train_iql:
+        print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}")
+
         logs = defaultdict(list)
 
         # Get our PPO model
