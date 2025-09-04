@@ -5,7 +5,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 
-paths = sorted(glob.glob("./logs/iql_minigrid_logs/log_expectile=*_decoy=*.csv"))
+paths = sorted(glob.glob("../logs/iql_minigrid_logs/log_expectile=*_decoy=*.csv"))
 
 # Read with polars for speed, then convert to pandas for seaborn
 dfs = []
