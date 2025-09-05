@@ -17,6 +17,7 @@ desired_ppo_agent_performance = '../logs/ppo_minigrid_logs/historic_bests/INSERT
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_ppo', default=False, help='Train PPO agent')
 parser.add_argument('--train_iql', default=False, help='Train IQL agent')
+parser.add_argument('--train_cql', default=False, help='Train CQL agent')
 parser.add_argument('--render_performance', default=False, help='Whether to render performance in final eval')
 parser.add_argument('--record_video', default=False, help='Whether to record video of performance rendering')
 
@@ -100,10 +101,11 @@ if __name__ == "__main__":
 
     train_ppo = args.train_ppo
     train_iql = args.train_iql
+    train_cql = args.train_cql
     render_performance = args.render_performance
     record_video = args.record_video
 
-    assert not (train_ppo and train_iql), "Please choose to train either PPO or IQL, not both."
+    assert not (train_ppo and (train_iql or train_cql)), "Please choose to train either PPO or IQL/CQL, not both."
 
     EXPECTILE = args.expectile
     DECOY_INTERVAL = args.decoy_interval
@@ -133,8 +135,9 @@ if __name__ == "__main__":
         model.learn(2e5, callback=eval_callback)  # Train for 500,000 step with early stopping
         model_loaded = True
 
-    if train_iql:
-        print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}")
+    if train_iql or train_cql:
+        if train_iql:
+            print(f"EXPECTILE: {EXPECTILE}, DECOY_INTERVAL: {DECOY_INTERVAL}")
 
         logs = defaultdict(list)
 
@@ -180,13 +183,22 @@ if __name__ == "__main__":
             logs['dataset_reward'].append(dataset_rewards.mean())
 
             # Alternately collect and training
-            algo = CustomIQL(observation_shape=base_env.observation_space.shape,
-                             action_size=base_env.action_space.n,
-                             feature_size=32,
-                             batch_size=32,
-                             expectile=EXPECTILE,
-                             gamma=GAMMA,
-                             device='cuda' if torch.cuda.is_available() else 'cpu')
+            if train_iql:
+                algo = CustomIQL(observation_shape=base_env.observation_space.shape,
+                                 action_size=base_env.action_space.n,
+                                 feature_size=32,
+                                 batch_size=32,
+                                 expectile=EXPECTILE,
+                                 gamma=GAMMA,
+                                 device='cuda' if torch.cuda.is_available() else 'cpu')
+            elif train_cql:
+                algo = CustomCQL(observation_shape=base_env.observation_space.shape,
+                                 action_size=base_env.action_space.n,
+                                 feature_size=32,
+                                 batch_size=32,
+                                 gamma=GAMMA,
+                                 device='cuda' if torch.cuda.is_available() else 'cpu')
+
             algo.compile()
 
             log_dict = algo.fit(
@@ -200,8 +212,12 @@ if __name__ == "__main__":
                 logs[f'{key}_eval'].append(log_dict[key][0])
 
         # Save logs
-        os.makedirs('../logs/iql_minigrid_logs', exist_ok=True)
-        pl.DataFrame(logs).write_csv(f'../logs/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}.csv')
+        if train_iql:
+            os.makedirs('../logs/iql_minigrid_logs', exist_ok=True)
+            pl.DataFrame(logs).write_csv(f'../logs/iql_minigrid_logs/log_expectile={EXPECTILE}_decoy={DECOY_INTERVAL}.csv')
+        elif train_cql:
+            os.makedirs('../logs/cql_minigrid_logs', exist_ok=True)
+            pl.DataFrame(logs).write_csv(f'../logs/cql_minigrid_logs/log_decoy={DECOY_INTERVAL}.csv')
 
     if render_performance:
         eval_env = gym.make(video_env_name if record_video else env_name,

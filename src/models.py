@@ -220,10 +220,21 @@ class CustomNet(nn.Module):
 
 
 class CustomIQL(nn.Module):
-    def __init__(self, observation_shape: Tuple[int, int, int], action_size: int,  input_length: int = 2,
-                 feature_size: int = 128, batch_size: int = 128, expectile: float = 0.7,
-                 gamma: float = 0.99, critic_lr: float = 3e-4, value_lr: float = 3e-4, actor_lr: float = 3e-4,
-                 device: str = 'cpu'):
+    def __init__(
+            self,
+            observation_shape: Tuple[int, int, int],
+            action_size: int,
+            input_length: int = 2,
+            feature_size: int = 128,
+            batch_size: int = 128,
+            expectile: float = 0.7,
+            gamma: float = 0.99,
+            critic_lr: float = 3e-4,
+            value_lr: float = 3e-4,
+            actor_lr: float = 3e-4,
+            tau_target: float = 0.005,
+            device: str = 'cpu'
+    ):
         super().__init__()
         self._feature_size = feature_size
         self._batch_size = batch_size
@@ -233,14 +244,18 @@ class CustomIQL(nn.Module):
         self._input_length = input_length
         self._device = device
         self._cloning_only = expectile == 0.5
+        self._tau_target = tau_target
+
         net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, device=device)
 
         self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
 
         self.critic_net1 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
         self.critic_net2 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+
         self.value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
         self.target_value_net = CustomNet(output_size=2, feature_extractor=self.feature_extractor, **net_kwargs)
+
         self.policy_net = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
 
         # Give both critic nets to the critic optimizer
@@ -254,8 +269,16 @@ class CustomIQL(nn.Module):
         for target_param, param in zip(self.target_value_net.decoder.parameters(), self.value_net.decoder.parameters()):
             target_param.data.copy_(param.data)
 
-    def fit(self, dataset, epochs: int = 1, n_steps_per_epoch: int = 1_000, evaluators=None,
-            show_progress: bool = True, experiment_name: str = None, dataset_kwargs: Optional[Dict] = None):
+    def fit(
+        self,
+        dataset,
+        epochs: int = 1,
+        n_steps_per_epoch: int = 1_000,
+        evaluators=None,
+        show_progress: bool = True,
+        experiment_name: str = None,
+        dataset_kwargs: Optional[Dict] = None
+    ):
         # Initialise our dataset and loss dictionary
         dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
         dataset.set_to_tensors(self._device)
@@ -280,7 +303,7 @@ class CustomIQL(nn.Module):
 
                     # Soft update of target value network
                     for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
-                        target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
+                        target_param.data.copy_((1-self._tau_target) * target_param.data + self._tau_target * param.data)
 
                     pbar.update(1)
                     pbar.set_postfix(epoch=epoch_str,
@@ -402,4 +425,268 @@ class CustomIQL(nn.Module):
             'critic_loss': deque(maxlen=100),
             'value_loss': deque(maxlen=100),
             'policy_loss': deque(maxlen=100)
+        }
+
+
+class CustomCQL(nn.Module):
+
+    def __init__(
+        self,
+        observation_shape: Tuple[int, int, int],
+        action_size: int,
+        input_length: int = 2,
+        feature_size: int = 128,
+        batch_size: int = 128,
+        gamma: float = 0.99,
+        critic_lr: float = 3e-4,
+        actor_lr: float = 3e-4,
+        alpha_cql: float = 1.0,                 # CQL penalty weight
+        policy_entropy: float = 0.01,
+        tau_target: float = 0.005,              # target network soft-update rate
+        device: str = "cpu",
+    ):
+        super().__init__()
+        self._feature_size = feature_size
+        self._batch_size = batch_size
+        self._gamma = gamma
+        self._device = device
+        self._input_length = input_length
+
+        self._alpha_cql = alpha_cql
+        self._alpha_ent = policy_entropy
+        self._policy_ent = policy_entropy
+        self._tau_target = tau_target
+        self._action_size = action_size
+
+        net_kwargs = dict(observation_shape=observation_shape, feature_size=feature_size, device=device)
+
+        # Shared feature extractor to mirror your IQL pattern
+        self.feature_extractor = OfflineMiniGridCNN(**net_kwargs).to(device)
+
+        # Critics output Q-values for all actions
+        self.critic_net1 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.critic_net2 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        # Target critics (clone decoders only, since feature_extractor is shared)
+        self.target_critic_net1 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+        self.target_critic_net2 = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        # Policy head outputs logits over discrete actions
+        self.policy_net = CustomNet(output_size=action_size * 2, feature_extractor=self.feature_extractor, **net_kwargs)
+
+        # Initialize target critics
+        for tp, p in zip(self.target_critic_net1.decoder.parameters(), self.critic_net1.decoder.parameters()):
+            tp.data.copy_(p.data)
+        for tp, p in zip(self.target_critic_net2.decoder.parameters(), self.critic_net2.decoder.parameters()):
+            tp.data.copy_(p.data)
+
+        # Optimizers
+        # Note: mirrors your pattern of optimizing 1st critic encoder + both decoders
+        self.critic_optim = torch.optim.AdamW(
+            list(self.critic_net1.encoder.parameters()) +
+            list(self.critic_net1.decoder.parameters()) +
+            list(self.critic_net2.decoder.parameters()),
+            lr=critic_lr
+        )
+        self.policy_optim = torch.optim.AdamW(self.policy_net.parameters(), lr=actor_lr)
+
+    # -------------------------
+    # Public API
+    # -------------------------
+    def fit(
+        self,
+        dataset,
+        epochs: int = 1,
+        n_steps_per_epoch: int = 1_000,
+        evaluators=None,
+        show_progress: bool = True,
+        experiment_name: str = None,
+        dataset_kwargs: Optional[Dict] = None
+    ):
+        dataset_kwargs = dict() if dataset_kwargs is None else dataset_kwargs
+        dataset.set_to_tensors(self._device)
+
+        loss_dict = self._reset_loss_dict()
+
+        with tqdm(total=epochs * n_steps_per_epoch, desc="Progress", mininterval=2.0, disable=not show_progress) as pbar:
+            for epoch in range(1, epochs + 1):
+                epoch_str = f"{epoch}/{epochs}"
+
+                for _ in range(n_steps_per_epoch):
+                    obs, acts, rews, next_obs, dones, flags, next_flags = dataset.sample_transition_batch(
+                        self._batch_size, **dataset_kwargs
+                    )
+
+                    # Critic (CQL) update
+                    loss_dict['critic_loss'].append(
+                        self._update_critic_cql(obs, acts, rews, next_obs, dones, flags, next_flags)
+                    )
+
+                    # Actor update
+                    loss_dict['policy_loss'].append(self._update_actor(obs, flags))
+
+                    # Soft update of target critics (decoder params only to mirror your design)
+                    self._soft_update_target_decoders()
+
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        epoch=epoch_str,
+                        policy_loss=f"{np.mean(loss_dict['policy_loss']):.5f}",
+                        critic_loss=f"{np.mean(loss_dict['critic_loss']):.5f}",
+                        refresh=False
+                    )
+
+                # Logging
+                loss_dict, log_dict = self._log_progress(
+                    epoch=epoch,
+                    loss_dict=loss_dict,
+                    experiment_name=experiment_name,
+                    evaluators=evaluators
+                )
+
+        return log_dict
+
+    def forward(self, obs, flags=None):
+        """
+        Returns:
+            q1, q2: [B, A]
+            logits: [B, A] policy logits
+        """
+        if flags is None:
+            flags = self._extract_flags(obs)
+        q1 = self.critic_net1(obs, flags=flags)  # [B, A]
+        q2 = self.critic_net2(obs, flags=flags)  # [B, A]
+        logits = self.policy_net(obs, flags=flags)  # [B, A]
+        return (q1, q2), logits
+
+    def predict(self, obs, flags=None, deterministic: bool = False):
+        obs = self._to_tensors(obs)[0]
+        if flags is None:
+            flags = self._extract_flags(obs)
+        logits = self.policy_net(obs, flags=flags)
+        if deterministic:
+            return logits.argmax(dim=-1).cpu().numpy()
+        dist = Categorical(logits=logits)
+        return dist.sample().cpu().numpy()
+
+    # -------------------------
+    # Updates
+    # -------------------------
+    def _update_critic_cql(self, obs, acts, rews, next_obs, dones, flags=None, next_flags=None):
+        """
+        Critic loss = Bellman error (min-Q soft backup under current policy) + CQL(H) penalty.
+        """
+        q1 = self.critic_net1(obs, flags=flags)  # [B, A]
+        q2 = self.critic_net2(obs, flags=flags)  # [B, A]
+
+        q_sa1 = q1.gather(1, acts.long())  # [B, 1]
+        q_sa2 = q2.gather(1, acts.long())  # [B
+        with torch.no_grad():
+            # Target min-Q
+            q1_next = self.target_critic_net1(next_obs, flags=next_flags)  # [B, A]
+            q2_next = self.target_critic_net2(next_obs, flags=next_flags)  # [B, A]
+            min_q_next = torch.min(q1_next, q2_next)
+
+            # Current policy at next states
+            logits_next = self.policy_net(next_obs, flags=next_flags)
+            log_pi_next = F.log_softmax(logits_next, dim=-1)
+            pi_next = log_pi_next.exp()  # [B, A]
+
+
+            # Soft value: V(s') = E_a[π(a|s') (minQ(s',a) - alpha * log π(a|s'))]
+            v_next = (pi_next * (min_q_next - self._policy_ent * log_pi_next)).sum(dim=-1, keepdim=True)
+
+            next_multistep_discount = torch.where(next_flags == 1, 3, 1)
+            current_multistep_discount = torch.where(flags == 1, 2, 0)
+            r = self._gamma ** current_multistep_discount * rews.float()
+            q_target = r + self._gamma ** next_multistep_discount * (1 - dones.float()) * v_next
+
+        # Bellman errors on data actions
+        bellman_loss = F.mse_loss(q_sa1, q_target) + F.mse_loss(q_sa2, q_target)
+
+        # CQL(H) penalty on both critics: logsumexp(Q) - Q(s,a_data)
+        cql_pen1 = (torch.logsumexp(q1, dim=-1, keepdim=True) - q_sa1).mean()
+        cql_pen2 = (torch.logsumexp(q2, dim=-1, keepdim=True) - q_sa2).mean()
+        cql_penalty = self._alpha_cql * (cql_pen1 + cql_pen2)
+
+        loss = bellman_loss + cql_penalty
+
+        self.critic_optim.zero_grad()
+        loss.backward()
+        self.critic_optim.step()
+        return loss.item()
+
+    def _update_actor(self, obs, flags=None):
+        logits = self.policy_net(obs, flags=flags)                 # [B, A]
+        log_pi = F.log_softmax(logits, dim=-1)                    # [B, A]
+        action_probs = log_pi.exp()
+
+        with torch.no_grad():
+            q1 = self.critic_net1(obs, flags=flags)
+            q2 = self.critic_net2(obs, flags=flags)
+            min_q = torch.min(q1, q2)
+
+        loss = (action_probs * (self._policy_ent * log_pi - min_q)).sum(1).mean()
+
+        self.policy_optim.zero_grad()
+        loss.backward()
+        self.policy_optim.step()
+        return loss.item()
+
+    # -------------------------
+    # Utilities
+    # -------------------------
+    def _soft_update_target_decoders(self):
+        # target = (1 - tau) * target + tau * online
+        tau = self._tau_target
+        with torch.no_grad():
+            for tparam, param in zip(self.target_critic_net1.decoder.parameters(), self.critic_net1.decoder.parameters()):
+                tparam.data.copy_((1.0 - tau) * tparam.data + tau * param.data)
+            for tparam, param in zip(self.target_critic_net2.decoder.parameters(), self.critic_net2.decoder.parameters()):
+                tparam.data.copy_((1.0 - tau) * tparam.data + tau * param.data)
+
+    def _extract_flags(self, obs):
+        # Mirrors your IQL flag extraction to remain compatible
+        obs = self._to_tensors(obs)[0]
+        if obs.shape[-1] in (1, 5):
+            return obs[:, -1, -1, 0].unsqueeze(-1).long()
+        return obs[:, 0, -1, -1].unsqueeze(-1).long()
+
+    # Backwards-compat alias (your IQL uses _extract_flag in predict)
+    def _extract_flag(self, obs):
+        return self._extract_flags(obs)
+
+    def _to_tensors(self, *arrays):
+        new_tensors = []
+        for arr in arrays:
+            if not isinstance(arr, torch.Tensor):
+                arr = torch.tensor(arr, dtype=torch.float32)
+            new_tensors.append(arr.to(self._device))
+        return new_tensors
+
+    def _log_progress(self, epoch: int, loss_dict: dict, experiment_name: str, evaluators: dict = None):
+        rewards = {}
+        if evaluators is not None:
+            for key in evaluators.keys():
+                mean_rew, std_rew = evaluators[key](self)
+                rewards[key] = (mean_rew, std_rew)
+
+        eval_str = '\n' + '=' * 40 + f"\nEpoch {epoch}:"
+        for key in rewards.keys():
+            eval_str += f"\n     {key} = {rewards[key][0]:.2f} +/- {rewards[key][1]:.2f}"
+        eval_str += f"\n\n     policy_loss = {np.mean(loss_dict['policy_loss']):.7f}"
+        eval_str += f"\n     critic_loss = {np.mean(loss_dict['critic_loss']):.7f}"
+        eval_str += f"\n     value_loss = {np.mean(loss_dict['value_loss']):.7f}\n"  # kept for parity
+        eval_str += '=' * 40 + '\n'
+        print(eval_str)
+
+        return self._reset_loss_dict(), rewards
+
+    @staticmethod
+    def _reset_loss_dict():
+        return {
+            'critic_loss': deque(maxlen=100),
+            'policy_loss': deque(maxlen=100),
+            # kept to preserve your progress print formatting
+            'value_loss': deque(maxlen=100)
         }
