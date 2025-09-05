@@ -84,12 +84,12 @@ no_video_additional_wrappers = additional_wrappers[1:]
 
 
 register(
-    id="LavaGapS7AltStep-v0",
+    id="LavaGapS6AltStep-v0",
     entry_point="gym_wrappers:make_lavastep_env",
     additional_wrappers=no_video_additional_wrappers,
 )
 register(
-    id="LavaGapS7AltStepWithVideo-v0",
+    id="LavaGapS6AltStepWithVideo-v0",
     entry_point="gym_wrappers:make_video_lavastep_env",
     additional_wrappers=additional_wrappers,
 )
@@ -115,8 +115,8 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=128),
     )
 
-    env_name = "LavaGapS7AltStep-v0"
-    video_env_name = "LavaGapS7AltStepWithVideo-v0"
+    env_name = "LavaGapS6AltStep-v0"
+    video_env_name = "LavaGapS6AltStepWithVideo-v0"
     if train_ppo:
         # Create eval callback
         save_each_best = SaveEachBestCallback(save_dir="../logs/ppo_minigrid_logs/historic_bests", verbose=1)

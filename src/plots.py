@@ -166,7 +166,7 @@ dataset_legend = ax.legend(
 ax.add_artist(task_legend)  # keep both legends
 
 plt.ylim(0.35, 1.0)
-ax.set_title("Impact of Time Binning on Deployment (All Expectiles)", fontsize=20, fontweight="bold", pad=15)
+ax.set_title("Live Returns with IQL after Time Binning (All Expectiles)", fontsize=20, fontweight="bold", pad=15)
 plt.tight_layout()
 plt.show()
 
@@ -246,7 +246,7 @@ for tick in ax.get_yticklabels():
     tick.set_fontsize(12)
 
 # Title (bold)
-ax.set_title("Live Returns after Time Binning",
+ax.set_title("Live Returns with IQL after Time Binning",
              fontsize=18, fontweight="bold", pad=12)
 
 # Legend (bold title)
