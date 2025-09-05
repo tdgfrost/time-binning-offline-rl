@@ -29,7 +29,7 @@ for p in paths:
 df_pl = pl.concat(dfs, how="vertical")
 cols = ["expectile", "decoy", "dataset_reward", "natural_alt_step_eval", "forced_one_step_eval"]
 df_pl = df_pl.select(cols)
-decoy_map = {"0": "Natural", "1": "Artificial One-Step", "2": "Artificial Two-Step"}
+decoy_map = {"0": "True 1-3", "1": "Artificial 1-1", "2": "Artificial 2-2"}
 df_pl = df_pl.with_columns(pl.col("decoy").cast(pl.Utf8).replace(decoy_map).alias("dataset"))
 
 df_long_pl = df_pl.unpivot(
@@ -42,16 +42,16 @@ df_long_pl = df_long_pl.with_columns([pl.col('expectile').cast(pl.Utf8).replace(
 df = df_long_pl.to_pandas()
 
 task_name_map = {
-    "natural_alt_step_eval": "Natural Alt-Step",
-    "forced_one_step_eval":  "Forced One-Step",
+    "natural_alt_step_eval": "Natural 1-3",
+    "forced_one_step_eval":  "Original 1-1",
 }
 df["task"] = df["task"].map(task_name_map)
 # df["expectile"] = df["expectile"].astype(float)
 
 # Fixed ordering
 expectile_order = ["Cloning", "0.6", "0.7", "0.8", "0.9"]
-dataset_order   = ['Natural', 'Artificial Two-Step', 'Artificial One-Step']
-task_order      = ["Natural Alt-Step", "Forced One-Step"]
+dataset_order   = ['True 1-3', 'Artificial 2-2', 'Artificial 1-1']
+task_order      = ["Natural 1-3", "Original 1-1"]
 
 df["expectile"] = pd.Categorical(df["expectile"], categories=expectile_order, ordered=True)
 df["dataset"]   = pd.Categorical(df["dataset"],   categories=dataset_order,   ordered=True)
@@ -155,7 +155,7 @@ ax.set_ylim(0, 1)
 # Build two legends: tasks (colors) and datasets (hatches)
 task_legend = ax.legend(
     [task_handles_once[t] for t in task_order],
-    task_order, title="Evaluation Task", title_fontproperties={"weight": "bold"},
+    task_order, title="LavaGap Environment", title_fontproperties={"weight": "bold"},
     loc="upper left", bbox_to_anchor=(1.01, 0.40), frameon=False
 )
 dataset_legend = ax.legend(
@@ -171,7 +171,7 @@ plt.tight_layout()
 plt.show()
 
 
-######
+#### Flip so that the x-axis is the evaluation task nd the group is the dataset type
 
 # If your summary expectile is categorical/string, match it as "0.7".
 # If it's numeric, use == 0.7 instead.
@@ -183,15 +183,14 @@ sum07["dataset"] = pd.Categorical(sum07["dataset"], categories=dataset_order, or
 sum07["task"] = pd.Categorical(sum07["task"], categories=task_order, ordered=True)
 
 # Colors: replace these with your task hex codes
-task_palette = ["#1f78b4", "#b2df8a"]  # Task order: [ "Natural Alt-Step", "Forced One-Step" ]
+task_palette = ["#1f78b4", "#b2df8a"]  # Task order: [ "Natural 1-3", "Forced 1-Step" ]
 
 sns.set_theme(context="talk", style="whitegrid")
 fig, ax = plt.subplots(figsize=(9, 4.8))
 
-x = np.arange(len(dataset_order))
-n_tasks = len(task_order)
-bar_width = 0.36
-offsets = [-bar_width / 2, +bar_width / 2]  # two tasks
+x = np.arange(len(task_order))
+bar_width = 0.25
+offsets = np.linspace(-bar_width, bar_width, len(dataset_order))  # three datasets
 
 # Baseline: use dataset_reward for this expectile if available; otherwise default to 0.75
 if "dataset_reward" in summary.columns:
@@ -203,55 +202,63 @@ else:
 # Horizontal baseline
 ax.axhline(baseline, ls="--", lw=1.5, alpha=0.9, zorder=0, color='#f33')
 
-ax.text(0.52, baseline + 0.01, f"Dataset Reward = {baseline:.2f}",
+ax.text(0.52, baseline + 0.01, f"Avg Dataset Return = {baseline:.2f}",
         ha="center", va="bottom", fontsize=12, color="red",
         transform=ax.get_yaxis_transform(),
         bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.8))
 
 # Draw bars by task
 handles = []
-for t_idx, task in enumerate(task_order):
-    sub = (sum07[sum07["task"] == task]
-           .set_index("dataset")
-           .reindex(dataset_order))  # align to x order
+for d_idx, dataset in enumerate(dataset_order):
+    sub = (sum07[sum07["dataset"] == dataset]
+           .set_index("task")
+           .reindex(task_order))  # align to tasks
 
     y = sub["mean_score"].to_numpy()
-    yerr = sub["yerr"].to_numpy() if "yerr" in sub.columns else sub["sem_score"].to_numpy()
+    yerr = sub["yerr"].to_numpy()
 
     bars = ax.bar(
-        x + offsets[t_idx], y, yerr=yerr,
+        x + offsets[d_idx], y, yerr=yerr,
         width=bar_width,
-        color=task_palette[t_idx],
+        label=dataset,
+        color=sns.color_palette("Set2")[d_idx],
         edgecolor="black",
         linewidth=0.8,
         capsize=3,
         zorder=3,
-        label=task,
     )
     handles.append(bars[0])
 
 # Axes cosmetics
 ax.set_xticks(x)
-ax.set_xticklabels(dataset_order, rotation=0)
-ax.set_xlabel("Dataset Type", labelpad=15)
+ax.set_xticklabels(task_order)
+ax.set_xlabel("LavaGap Environment", labelpad=15)
 ax.set_ylabel("Average Return")
 ax.set_ylim(0.0, 1.0)
 
+ax.legend(handles, dataset_order, title="Dataset", frameon=True, fontsize=12)
+
 for tick in ax.get_xticklabels():
     tick.set_fontstyle("italic")
-    tick.set_fontsize(12)
+    tick.set_fontsize(13)
 
 for tick in ax.get_yticklabels():
     tick.set_fontsize(12)
 
 # Title (bold)
-ax.set_title("Live Returns based on Dataset",
+ax.set_title("Live Returns after Time Binning",
              fontsize=18, fontweight="bold", pad=12)
 
 # Legend (bold title)
-leg = ax.legend(handles, task_order, title="Evaluation Task", frameon=True, fontsize=13, loc=(1.05, 0.5))
-leg.set_title("Evaluation Task", prop={"weight": "bold", "size": 13})
-for t in leg.get_texts(): t.set_fontsize(11)
+leg = ax.legend(
+    handles, dataset_order,
+    title="Dataset",
+    frameon=True,
+    fontsize=15,
+    loc=(1.05, 0.5)
+)
+leg.set_title("Dataset", prop={"weight": "bold", "size": 15})
+for t in leg.get_texts(): t.set_fontsize(13)
 
 plt.tight_layout()
 plt.ylim(0.4, 1.0)
