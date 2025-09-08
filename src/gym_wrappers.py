@@ -10,8 +10,8 @@ from datetime import datetime
 
 class AlternateStepWrapper(RecordConstructorArgs, Wrapper):
     """
-    A wrapper that, with a given probability, performs a second
-    'bonus' step using the same action.
+    A wrapper that may perform additional
+    'bonus' steps using the same action.
     """
 
     def __init__(self, env: gym.Env, max_steps: int = 100, forced_interval: int = 0, fixed_reward: bool = True) -> None:
