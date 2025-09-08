@@ -5,6 +5,9 @@ from pathlib import Path
 from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
 from collections import deque
+import argparse
+import inquirer
+import os
 
 
 class ReplayBufferEnv:
@@ -192,3 +195,25 @@ class EnvironmentEvaluator:
         return float(np.mean(mean_returns)), float(np.std(mean_returns) / np.sqrt(self.n_trials))
 
 
+def parse_bool(value, name: str = ''):
+    if isinstance(value, str) and value.lower() in ['true', 'false']:
+        return value.lower() == "true"
+    elif isinstance(value, (int, float)) and value in [0, 1]:
+        return bool(value)
+    elif isinstance(value, bool):
+        return value
+    else:
+        raise argparse.ArgumentTypeError(
+            f"Invalid value for {name}: '{value}'. Must be a boolean e.g., True or true.")
+
+
+def choose_ppo_agent():
+    # Use inquirer to let the user select a folder
+    message = "Please select PPO agent using UP/DOWN/ENTER."
+    options = os.listdir("../logs/ppo_minigrid_logs/historic_bests")
+    options = [i for i in options if i.endswith('.zip')]
+    question = [inquirer.List('option',
+                              message=message,
+                              choices=options)]
+    answer = inquirer.prompt(question)
+    return f"../logs/ppo_minigrid_logs/historic_bests/{answer['option']}"

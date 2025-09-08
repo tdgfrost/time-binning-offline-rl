@@ -11,14 +11,13 @@ from utils import *
 from gym_wrappers import *
 from models import *
 
-desired_ppo_agent_performance = '../logs/ppo_minigrid_logs/historic_bests/INSERT_DESIRED_MODEL_HERE.zip'
-
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--train_ppo', default=False, help='Train PPO agent')
-parser.add_argument('--train_iql', default=False, help='Train IQL agent')
-parser.add_argument('--render_performance', default=False, help='Whether to render performance in final eval')
-parser.add_argument('--record_video', default=False, help='Whether to record video of performance rendering')
+parser.add_argument('--train_ppo', default=False, type=parse_bool, help='Train PPO agent')
+parser.add_argument('--train_iql', default=False, type=parse_bool, help='Train IQL agent')
+parser.add_argument('--ppo_agent', default=None, type=str, help='Path to pre-trained PPO agent')
+parser.add_argument('--render_performance', default=False, type=parse_bool, help='Whether to render performance in final eval')
+parser.add_argument('--record_video', default=False, type=parse_bool, help='Whether to record video of performance rendering')
 
 parser.add_argument('--expectile', default=0.5, type=float, help='Expectile value for IQL training (0.5 is BC)')
 parser.add_argument('--decoy_interval', default=0, type=int, help='Decoy interval: 0 (natural), 1 (1-step), 2 (2-step)')
@@ -103,6 +102,14 @@ if __name__ == "__main__":
     render_performance = args.render_performance
     record_video = args.record_video
 
+    if train_iql or render_performance:
+        ppo_agent = f'../logs/ppo_minigrid_logs/{args.ppo_agent}' if args.ppo_agent is not None else None
+        if ppo_agent is None:
+            ppo_agent = choose_ppo_agent()
+        assert ppo_agent is not None, ("Please provide a pre-trained PPO agent from the logs/ppo_minigrid_logs folder "
+                                       "for IQL training.")
+        assert os.path.exists(ppo_agent), "Provided PPO agent path does not exist."
+
     assert not (train_ppo and train_iql), "Please choose to train either PPO or IQL, not both."
 
     EXPECTILE = args.expectile
@@ -144,7 +151,7 @@ if __name__ == "__main__":
         # Fill our replay buffer (or load pre-filled)
         replay_buffer_env = ReplayBufferEnv(base_env, buffer_size=1000000)
         if not os.path.exists('./dataset.pkl'):
-            model = CallablePPO.load(desired_ppo_agent_performance, env=base_env, device="auto")
+            model = CallablePPO.load(ppo_agent, env=base_env, device="auto")
             model_loaded = True
             replay_buffer_env.fill_buffer(model=model, n_frames=100_000)
             with open('./dataset.pkl', 'wb') as f:
@@ -165,8 +172,8 @@ if __name__ == "__main__":
         # Get our evaluators
         evaluators = {}
         for key, (interval, flag) in [
-            ["natural_alt_step", (0, not DECOY_INTERVAL)],
-            ["forced_one_step", (1, False)],
+            ["lavagap_1_3", (0, not DECOY_INTERVAL)],
+            ["lavagap_1_1", (1, False)],
         ]:
             evaluators[key] = EnvironmentEvaluator(gym.make(env_name,
                                                             max_steps=50,
@@ -211,7 +218,7 @@ if __name__ == "__main__":
                             tile_size=128)
 
         if not model_loaded:
-            model = CallablePPO.load(desired_ppo_agent_performance, env=eval_env, device="auto")
+            model = CallablePPO.load(ppo_agent, env=eval_env, device="auto")
 
         total_episodes = 10
         for ep_number in range(total_episodes):
