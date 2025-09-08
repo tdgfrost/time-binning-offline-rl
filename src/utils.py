@@ -10,24 +10,16 @@ from collections import deque
 class ReplayBufferEnv:
     def __init__(self, env, buffer_size: int = 100000):
         self.observations = {
-            0: deque(maxlen=buffer_size),
-            1: deque(maxlen=buffer_size),
-            2: deque(maxlen=buffer_size)
+            i: deque(maxlen=buffer_size) for i in range(3)
         }
         self.actions = {
-            0: deque(maxlen=buffer_size),
-            1: deque(maxlen=buffer_size),
-            2: deque(maxlen=buffer_size)
+            i: deque(maxlen=buffer_size) for i in range(3)
         }
         self.rewards = {
-            0: deque(maxlen=buffer_size),
-            1: deque(maxlen=buffer_size),
-            2: deque(maxlen=buffer_size)
+            i: deque(maxlen=buffer_size) for i in range(3)
         }
         self.dones = {
-            0: deque(maxlen=buffer_size),
-            1: deque(maxlen=buffer_size),
-            2: deque(maxlen=buffer_size)
+            i: deque(maxlen=buffer_size) for i in range(3)
         }
 
         self.buffer_size = buffer_size
@@ -92,16 +84,12 @@ class ReplayBufferEnv:
             if self._device == device:
                 return
             for i in [0, 1, 2]:
-                self.observations[i] = self.observations[i].to(device)
-                self.actions[i] = self.actions[i].to(device)
-                self.rewards[i] = self.rewards[i].to(device)
-                self.dones[i] = self.dones[i].to(device)
+                for arr in [self.observations, self.actions, self.rewards, self.dones]:
+                    arr[i] = arr[i].to(device)
         else:
             for i in [0, 1, 2]:
-                self.observations[i] = torch.from_numpy(np.array(self.observations[i])).to(device)
-                self.actions[i] = torch.from_numpy(np.array(self.actions[i])).to(device)
-                self.rewards[i] = torch.from_numpy(np.array(self.rewards[i])).to(device)
-                self.dones[i] = torch.from_numpy(np.array(self.dones[i])).to(device)
+                for arr in [self.observations, self.actions, self.rewards, self.dones]:
+                    arr[i] = torch.from_numpy(np.array(arr[i])).to(device)
 
         self._tensors_set = True
         self._device = device
@@ -118,10 +106,9 @@ class ReplayBufferEnv:
 
     def update_permanent_buffer(self, ep_buffer: dict):
         for i, decoy_maybe in [(0, ''), (1, 'decoy_')]:
-            self.observations[i] += ep_buffer[f'{decoy_maybe}obs']
-            self.actions[i] += ep_buffer[f'{decoy_maybe}action']
-            self.rewards[i] += ep_buffer[f'{decoy_maybe}reward']
-            self.dones[i] += ep_buffer[f'{decoy_maybe}done']
+            for arr, key in [
+                (self.observations, 'obs'), (self.actions, 'action'), (self.rewards, 'reward'), (self.dones, 'done')]:
+                arr[i] += ep_buffer[f'{decoy_maybe}{key}']
 
         obs, actions, rewards, dones = [
             [ep_buffer[f'decoy_{key}'][idx] for idx in range(0, len(ep_buffer[f'decoy_{key}']), 2)]
