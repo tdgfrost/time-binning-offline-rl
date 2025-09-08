@@ -4,6 +4,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 
 paths = sorted(glob.glob("../logs/iql_minigrid_logs/log_expectile=*_decoy=*.csv"))
 
@@ -29,7 +30,7 @@ for p in paths:
 df_pl = pl.concat(dfs, how="vertical")
 cols = ["expectile", "decoy", "dataset_reward", "natural_alt_step_eval", "forced_one_step_eval"]
 df_pl = df_pl.select(cols)
-decoy_map = {"0": "True 1-3", "1": "Artificial 1-1", "2": "Artificial 2-2"}
+decoy_map = {"0": "Real 1-3", "1": "Artificial 1-1", "2": "Artificial 2-2"}
 df_pl = df_pl.with_columns(pl.col("decoy").cast(pl.Utf8).replace(decoy_map).alias("dataset"))
 
 df_long_pl = df_pl.unpivot(
@@ -42,16 +43,16 @@ df_long_pl = df_long_pl.with_columns([pl.col('expectile').cast(pl.Utf8).replace(
 df = df_long_pl.to_pandas()
 
 task_name_map = {
-    "natural_alt_step_eval": "Natural 1-3",
-    "forced_one_step_eval":  "Original 1-1",
+    "natural_alt_step_eval": "LavaGap 1-3",
+    "forced_one_step_eval":  "LavaGap 1-1",
 }
 df["task"] = df["task"].map(task_name_map)
 # df["expectile"] = df["expectile"].astype(float)
 
 # Fixed ordering
 expectile_order = ["Cloning", "0.6", "0.7", "0.8", "0.9"]
-dataset_order   = ['True 1-3', 'Artificial 2-2', 'Artificial 1-1']
-task_order      = ["Natural 1-3", "Original 1-1"]
+dataset_order   = ['Real 1-3', 'Artificial 2-2', 'Artificial 1-1']
+task_order      = ["LavaGap 1-3", "LavaGap 1-1"]
 
 df["expectile"] = pd.Categorical(df["expectile"], categories=expectile_order, ordered=True)
 df["dataset"]   = pd.Categorical(df["dataset"],   categories=dataset_order,   ordered=True)
@@ -156,18 +157,20 @@ ax.set_ylim(0, 1)
 task_legend = ax.legend(
     [task_handles_once[t] for t in task_order],
     task_order, title="LavaGap Environment", title_fontproperties={"weight": "bold"},
-    loc="upper left", bbox_to_anchor=(1.01, 0.40), frameon=False
+    loc="upper left", bbox_to_anchor=(1.0, 0.40), frameon=False
 )
 dataset_legend = ax.legend(
     [dataset_handles_once[d] for d in dataset_order],
     dataset_order, title="Dataset", title_fontproperties={"weight": "bold"},
-    loc="upper left", bbox_to_anchor=(1.01, 0.95), frameon=False
+    loc="upper left", bbox_to_anchor=(1.04, 0.95), frameon=False
 )
 ax.add_artist(task_legend)  # keep both legends
 
 plt.ylim(0.35, 1.0)
 ax.set_title("Live Returns with IQL after Time Binning (All Expectiles)", fontsize=20, fontweight="bold", pad=15)
-plt.tight_layout()
+os.makedirs('../figures', exist_ok=True)
+fig.subplots_adjust(right=0.75, left=0.1, bottom=0.15)
+plt.savefig('../figures/Time Binning All Expectiles.png', dpi=1500)
 plt.show()
 
 
@@ -183,7 +186,7 @@ sum07["dataset"] = pd.Categorical(sum07["dataset"], categories=dataset_order, or
 sum07["task"] = pd.Categorical(sum07["task"], categories=task_order, ordered=True)
 
 # Colors: replace these with your task hex codes
-task_palette = ["#1f78b4", "#b2df8a"]  # Task order: [ "Natural 1-3", "Forced 1-Step" ]
+task_palette = ["#1f78b4", "#b2df8a"]
 
 sns.set_theme(context="talk", style="whitegrid")
 fig, ax = plt.subplots(figsize=(9, 4.8))
@@ -255,14 +258,14 @@ leg = ax.legend(
     title="Dataset",
     frameon=True,
     fontsize=15,
-    loc=(1.05, 0.5)
+    loc=(1.05, 0.3)
 )
 leg.set_title("Dataset", prop={"weight": "bold", "size": 15})
 for t in leg.get_texts(): t.set_fontsize(13)
 
-plt.tight_layout()
 plt.ylim(0.4, 1.0)
 plt.grid(False)
 ax.grid(True, axis="y")
-
+plt.tight_layout()
+plt.savefig('../figures/Time Binning.png', dpi=1500, bbox_inches='tight')
 plt.show()
